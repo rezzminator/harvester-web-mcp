@@ -1,0 +1,332 @@
+# harvester
+
+A multi-format MCP **fetch + search** server. It converts web pages, PDFs, Office documents,
+archives, and local files to clean Markdown; resolves scholarly identifiers (DOI/ISBN/title) to a
+free, legal full-text copy; caches every artifact on disk under a type-partitioned `.fetch/` tree;
+and escalates through a four-stage wall-bypass ladder before surfacing an error.
+
+> [!CAUTION]
+> This server can access local files and local/internal IP addresses, and it reaches out to the
+> open web. It may represent a security risk. Run it with the least privilege you can, and ensure it
+> does not expose sensitive data. (Credential and key files are refused — see
+> [Local-path support](#local-path-support-and-deny-paths).)
+
+- **Repo:** <https://github.com/mreza0100/harvester-web-mcp>
+- **Package name:** `harvester-mcp` (not yet on PyPI — install from source or from GitHub)
+- **Command / module:** `harvester` (`python -m harvester`)
+
+---
+
+## What it does
+
+**One API, many formats.** Pass a URL, a local path, or a scholarly identifier — `harvester`
+detects the format, routes it to the right converter, caches the Markdown result, and returns the
+full content. A second call on the same input is served from cache with no refetch.
+
+**Wall-bypass ladder.** For an HTML page the server tries four methods in order, stopping as soon
+as it gets rich content:
+
+1. **httpx** — standard HTTP with trafilatura extraction (`favor_recall`); article images are
+   downloaded locally and `![](remote)` links are rewritten to local cache paths.
+2. **curl_cffi Chrome impersonation** — replays a real Chrome TLS/JA3 fingerprint; bypasses many
+   bot-detection CDNs.
+3. **Jina Reader** (`https://r.jina.ai/<url>`) — external headless extraction; skipped for
+   private/internal hosts.
+4. **Open-access mirror** — extracts a DOI from the URL (or scrapes a `citation_pdf_url` /
+   `citation_doi` meta tag from the blocked landing page), then resolves through Europe PMC PDF →
+   PMC article HTML → the full open-access chain (Unpaywall, OpenAlex, Semantic Scholar, CORE,
+   DOAJ, arXiv/OSF) → a Wayback Machine snapshot. This is the headline path for walled academic
+   publishers.
+
+PDF/Office/archive downloads share the spirit of the ladder: an empty or 403 download is retried
+with curl_cffi impersonation, and a walled publisher PDF URL that carries an extractable DOI pivots
+to the open-access mirror before giving up.
+
+Hard IP-reputation blocks (publisher DRM, a paywall requiring authentication) are not solvable
+without a residential exit node — that is out of scope, and the server surfaces a clear error
+message when it applies.
+
+---
+
+## Format matrix
+
+| Input | Converter | Cache subdir |
+|---|---|---|
+| Web page / HTML | trafilatura (`favor_recall`, images localised) | `.fetch/html/` |
+| PDF URL or file (header-sniffed for extensionless URLs) | pymupdf4llm | `.fetch/pdf/` |
+| DOCX, XLSX, PPTX | Docling | `.fetch/docx/` `.fetch/xlsx/` `.fetch/pptx/` |
+| CSV | MarkItDown | `.fetch/csv/` |
+| JSON | literal pretty-print in a ` ```json ``` ` block | `.fetch/json/` |
+| Image (JPG/PNG/GIF/WebP/BMP/SVG/TIFF) | saved locally, path returned for vision | `.fetch/<ext>/` |
+| Archive (.zip / .tar(.gz/.bz2/.xz) / .7z / .rar) | safe listing, member on request | `.fetch/<kind>/` |
+| Archive member (`source::path/to/member`) | routed by member extension | `.fetch/archive_member/` |
+| Local path or `file://` URL | same routing, no network | same tree |
+
+**Image localisation:** trafilatura extracts `![](remote-url)` links; each image is downloaded
+concurrently (cap: 50 images, 10 MB each) into `.fetch/<ext>/` and the link is rewritten to the
+local path, making figures readable by vision tools.
+
+**Header-sniff routing:** content-type and magic bytes override the URL extension, so
+`https://arxiv.org/pdf/1706.03762` (no `.pdf`) is correctly routed to pymupdf4llm. A `.pdf` URL
+that actually serves an HTML wall is rejected rather than fed to the PDF parser as a silent wrong
+document.
+
+**DOI / ISBN fast-path:** bare DOIs (`10.xxxx/...`), `doi:` prefixes, `doi.org` URLs, bare ISBNs
+and `isbn:` strings skip the HTTP ladder and go straight to the open-access resolver. Bare
+PMID/PMCID identifiers resolve through Europe PMC as well.
+
+---
+
+## Tools
+
+The server exposes six tools (`search` appears only when a search backend is configured — see
+below).
+
+### `fetch`
+
+Converts one or many **sources** to clean Markdown, returned in input order with full content.
+
+- `sources` (array of strings, **required**, 1–50 items) — each item is a **location** (web URL,
+  local path, or `file://` URL → web page / PDF / DOCX / XLSX / PPTX / CSV / JSON) or an
+  **unambiguous identifier** (a DOI as `10.xxxx/…`, `doi:…`, or a `doi.org` URL; a book as
+  `isbn:9780262300988` or a bare ISBN). Identifiers are resolved to a free, legal copy and then
+  converted. Mix kinds in one batch; a failing item returns a descriptive per-item error and the
+  rest still return.
+
+`fetch` returns document Markdown only. Pass it an image, an archive, or a bare title and it points
+you at the right sibling tool (`downloadImage`, `archive`, `find`) instead of guessing. Each result
+carries a short header (source, cache_status, method, bytes, cache path) followed by the content.
+
+### `find`
+
+The scholarly counterpart of web search: a TITLE or free-text bibliographic query → a ranked list
+of candidate works (papers + books), each with a ready-to-use `fetch:` handle. It downloads
+nothing — you pick a candidate and pass its handle to `fetch` (the `find → fetch` pattern). Papers
+come from OpenAlex; books from Open Library + Project Gutenberg.
+
+- `query` (string, **required**) — a paper/book title or free-text query.
+- `limit` (integer, optional, default **8**, range 1–25) — maximum candidate works to return.
+
+### `search`
+
+An open-web search — title · URL · snippet · engine — to triage; retrieve the URLs you want with
+`fetch` (the `search → fetch` pattern). Returns links and snippets, not cleaned content.
+
+- `query` (string, **required**) — the web search query.
+- `count` (integer, optional, default **8**, range 1–20) — maximum results.
+- `lang` (string, optional, default `""`) — language/locale to bias the search (e.g. `zh`, `ja`,
+  `pt-BR`); routes the query to that language's native engines to reach non-English literature.
+- `engines` (string, optional, default `""`) — comma-separated SearXNG engines to restrict to
+  (e.g. `google,brave` or `naver,yahoo`). Omit for the default aggregated set.
+
+**Backends (see [Web search](#web-search)):** the tool is shown only when a backend is configured.
+
+### `downloadImage`
+
+Downloads one or many images and returns their LOCAL FILE PATHS to read with vision — figures,
+photos, charts, scanned pages. Images are saved, not OCR'd; open the returned path to see the
+content.
+
+- `sources` (array of strings, **required**, 1–50 items) — image URLs or local image paths. Each
+  is saved under `.fetch/<ext>/` (e.g. `.fetch/png/`, `.fetch/jpg/`) and its path is returned in
+  order.
+
+### `archive`
+
+Safely browses a single archive — `.zip` / `.tar(.gz/.bz2/.xz)` / `.7z` / `.rar` — by URL or local
+path. Two-step, like `find → fetch`.
+
+- `source` (string, **required**) — URL or local path of the archive.
+- `member` (string, optional, default `null`) — omit to get the SAFE member listing (names + sizes;
+  nothing is extracted to disk). Give a member name from that listing to fetch just that member,
+  converted to Markdown. Path-traversal and symlink members are refused; member-count/size caps are
+  enforced; the archive is never auto-extracted.
+
+### `grep_cache`
+
+Searches every page already cached under `.fetch/` for a regex pattern — recall what you have
+already fetched without re-crawling. Returns matching source URLs/paths with match counts and a
+sample line.
+
+- `pattern` (string, **required**) — regex pattern.
+- `max_results` (integer, optional, default **50**, range 1–1000) — maximum matching pages.
+- `ignore_case` (boolean, optional, default **true**) — case-insensitive search.
+
+---
+
+## Prompts
+
+- `fetch` — fetch a URL or local path and return its full extracted Markdown. Argument: `url`
+  (required).
+
+---
+
+## Web search
+
+The `search` tool has two backends and is **hidden entirely** unless one is configured (the model
+never sees a dead "configure me" tool).
+
+- **`SEARXNG_URL`** (primary) — base URL of a self-hosted [SearXNG](https://searxng.org)
+  (e.g. `http://127.0.0.1:8888`). Free, self-hosted, aggregates 200+ engines (less single-engine /
+  SEO bias than a plain Google search), and routes per-language to regional engines — the
+  multilingual lever behind the `lang` / `engines` parameters.
+- **`BRAVE_API_KEY`** (managed fallback) — a Brave Search API token, used when SearXNG is
+  unconfigured, down, or blocked for a locale.
+- **`HARVESTER_DISABLE_SEARCH`** — set to `1`/`true`/`yes`/`on` to force-hide the `search` tool even
+  when a backend is configured.
+
+The tool appears when `SEARXNG_URL` and/or `BRAVE_API_KEY` is set (and `HARVESTER_DISABLE_SEARCH` is
+not truthy). SearXNG is tried first, then Brave.
+
+---
+
+## Local-path support and deny-paths
+
+Local files and `file://` URLs are fully supported, routed by the same detector with no network
+access. Credential and key files are refused — the deny list covers:
+
+- **Directories:** `.ssh`, `.gnupg`, `.aws`, `.password-store`, `.docker`.
+- **Names:** `id_rsa`, `id_ed25519`, `id_dsa`, `id_ecdsa`, `credentials`, `.netrc`, `.pgpass`,
+  `.htpasswd`, `shadow`, `master.key`.
+- **Suffixes:** `.pem`, `.key`, `.p12`, `.pfx`, `.keystore`, `.jks`, `.asc`, `.gpg`, `.kdbx`,
+  `.ppk`, `.env` (and `.env.*`), plus any name containing a private-key marker
+  (`_rsa`, `_ed25519`, `_dsa`, `_ecdsa`).
+
+The check runs on both a path and its symlink target, so an innocently named symlink can't smuggle
+a secret. Outbound web fetches also apply an SSRF guard that refuses private / internal / link-local
+hosts (including obfuscated IP forms).
+
+---
+
+## Cache
+
+The cache lives at `.fetch/` at the project root (the directory containing `pyproject.toml`),
+overridable with `WEBFETCH_DIR`. Every artifact is type-partitioned:
+
+```
+.fetch/
+  html/<slug>__<sha1>.md
+  pdf/<slug>__<sha1>.md       (and the source .pdf alongside)
+  docx/  xlsx/  pptx/  csv/  json/
+  png/   jpg/   gif/   webp/  …     (images and image-bearing kinds)
+  archive_member/<slug>__<sha1>.md
+```
+
+Slugs are filesystem-safe and suffixed with a 10-char SHA-1 of the input for collision safety.
+Failing fetches are held in a short-lived in-memory negative cache (default 120 s, see
+`HARVESTER_NEG_TTL`) so a dead source is not re-hammered; concurrent calls for the same input share
+a single in-flight fetch.
+
+---
+
+## Installation
+
+The package is **not yet published to PyPI**. Install from source or straight from GitHub.
+
+### From source
+
+```bash
+git clone https://github.com/mreza0100/harvester-web-mcp
+cd harvester-web-mcp
+uv sync            # install dependencies into the local venv
+uv run harvester   # run the server (stdio)
+```
+
+### From GitHub
+
+```bash
+# run without cloning
+uvx --from git+https://github.com/mreza0100/harvester-web-mcp harvester
+
+# or install into an environment
+pip install git+https://github.com/mreza0100/harvester-web-mcp
+python -m harvester
+```
+
+### Once published to PyPI
+
+```bash
+uvx --from harvester-mcp harvester     # or: pip install harvester-mcp
+```
+
+---
+
+## Configuration
+
+Add to your MCP client config (the `git+https` form needs no clone):
+
+```json
+{
+  "mcpServers": {
+    "harvester": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/mreza0100/harvester-web-mcp", "harvester"]
+    }
+  }
+}
+```
+
+To relocate the cache and enable web search, pass environment variables:
+
+```json
+{
+  "mcpServers": {
+    "harvester": {
+      "command": "uvx",
+      "args": ["--from", "git+https://github.com/mreza0100/harvester-web-mcp", "harvester"],
+      "env": {
+        "WEBFETCH_DIR": "/path/to/cache",
+        "SEARXNG_URL": "http://127.0.0.1:8888"
+      }
+    }
+  }
+}
+```
+
+### Environment variables
+
+| Variable | Default | Effect |
+|---|---|---|
+| `WEBFETCH_DIR` | `.fetch/` at project root | Relocate the on-disk cache. |
+| `HARVESTER_MAX_INLINE_CHARS` | `50000` | Cap on the Markdown returned inline per source; the cache file always holds the full text (read the returned path for everything). |
+| `HARVESTER_NEG_TTL` | `120` | Seconds a failed fetch is remembered in the negative cache. |
+| `HARVESTER_PDF_OCR` | off | Run Tesseract OCR on image-only PDF pages (slow; off by default for fast text-layer extraction). |
+| `HARVESTER_PDF_LAYOUT` | off | Run the pymupdf4llm layout model for higher table/heading fidelity (slow). |
+| `HARVESTER_LOG_FILE` | unset | Write logs to this file. |
+| `HARVESTER_LOG_LEVEL` | `INFO` | Log level. |
+| `SEARXNG_URL` | empty | Self-hosted SearXNG base URL — primary `search` backend (enables the tool). |
+| `BRAVE_API_KEY` | empty | Brave Search API token — fallback `search` backend (enables the tool). |
+| `HARVESTER_DISABLE_SEARCH` | off | Force-hide the `search` tool even when a backend is configured. |
+| `HARVESTER_CONTACT_EMAIL` | **empty** | Polite-pool contact for scholarly APIs (Crossref / Unpaywall / NCBI). Empty by default, so the published tool sends **no** contact; operators opt in. When set, it is sent as a `mailto:` UA suffix and `?email=` / `?mailto=` parameter — better rate limits, never required. |
+| `CORE_API_KEY` | empty | Optional [CORE](https://core.ac.uk) API key. |
+| `SEMANTIC_SCHOLAR_API_KEY` | empty | Optional Semantic Scholar API key. |
+| `GOOGLE_BOOKS_API_KEY` | empty | Optional Google Books API key. |
+
+Every scholarly source works **keyless** — the optional API keys only raise rate limits and
+full-text coverage; nothing is hard-gated behind a key.
+
+### CLI flags
+
+| Flag | Effect |
+|---|---|
+| `--user-agent <UA>` | Override the default User-Agent (`Mozilla/5.0 (compatible; harvester/1.0)`). |
+| `--proxy-url <URL>` | Route all outbound requests through this proxy (e.g. `http://proxy:8080`). |
+| `--ignore-robots-txt` | No-op, kept for compatibility — robots.txt is never enforced. |
+
+---
+
+## Development
+
+```bash
+uv sync
+uv run pytest -q
+uv run ruff check .
+uv run pyright src/
+```
+
+---
+
+## License
+
+MIT. See [LICENSE](LICENSE). This project builds on MIT-licensed fetch-server scaffolding; the
+original copyright notice is retained in the license file.

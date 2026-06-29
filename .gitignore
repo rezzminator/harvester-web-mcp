@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+build/
+dist/
+
+# uv / virtualenv
+.venv/
+
+# tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+.pyright/
+
+# the on-disk fetch cache (URL-keyed markdown + downloaded assets)
+.fetch/
+
+# runtime scratch — logs (tmp/logs/harvester.log) and any working files
+tmp/
+
+# OS cruft
+.DS_Store
+Thumbs.db
