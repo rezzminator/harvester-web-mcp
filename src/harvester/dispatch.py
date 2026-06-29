@@ -485,9 +485,7 @@ async def _pmcid_to_result(
     Returns a result dict, or None when neither yields usable content. The artifact is cached
     under *key*. Shared by the DOI mirror and the bare-PMID/PMCID routing.
     """
-    from httpx import AsyncClient
-
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with net._client(proxy_url) as client:
         pdf_bytes = await mirror.europepmc_pdf(pmcid, client)
     if pdf_bytes:
         result = await _mirror_pdf_result(pdf_bytes, key, pmcid, user_agent, proxy_url)
@@ -516,6 +514,15 @@ async def _candidate_to_result(
     Returns a result dict, or None when the candidate yields nothing usable (so the caller tries
     the next one). The artifact is cached under *key* (the identifier), not the candidate URL.
     """
+    # SSRF/scheme chokepoint for EVERY candidate (OA resolvers + the scraped citation_pdf_url):
+    # candidate URLs come from third-party JSON / attacker-influenced page <meta> tags and bypass
+    # the dispatch-time guard. Cheap lexical first filter here; the net layer resolves DNS + every
+    # redirect hop. Refusing here also stops a file:// candidate from reaching the curl_cffi retry.
+    _scheme = urlparse(cand.url).scheme.lower()
+    if _scheme not in ("http", "https") or net.is_private_host(cand.url):
+        log.warning("oa candidate refused (scheme/host) %s (%s): %s", cand.source, cand.kind_hint, cand.url)
+        return None
+
     data, _status, _ekind, ct = await net.fetch_bytes_with_meta(cand.url, user_agent, proxy_url)
     if not data:  # walled? retry with a Chrome TLS/JA3 fingerprint
         data, _ = await net.download_impersonated(cand.url, proxy_url)
@@ -572,8 +579,7 @@ async def _resolve_input(
     kind: str, value: str, key: str, user_agent: str, proxy_url: str | None
 ) -> dict:
     """Resolve an ISBN/book identifier to content through the OA chain (books are unambiguous)."""
-    from httpx import AsyncClient
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with net._client(proxy_url) as client:
         cands = await oa.resolve_book(value, client)
         res = await _resolve_and_fetch(cands, key, kind, user_agent, proxy_url)
     if res:
@@ -671,8 +677,6 @@ async def _doi_mirror_result(
 
     Tries in order: Europe PMC PDF → PMC article HTML → Wayback snapshot of doi.org URL.
     """
-    from httpx import AsyncClient
-
     log.info("doi mirror %s", doi)
     # Cache-first: a repeated DOI must not re-download + re-convert (~40s) or write a second,
     # divergent artifact. DOI artifacts are keyed by the bare DOI (dedup across input forms).
@@ -684,7 +688,7 @@ async def _doi_mirror_result(
                 if body.strip():
                     log.info("doi mirror cache hit %s (%s)", doi, kind)
                     return _hit(cached, meta.get("method", "cached"), body)
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with net._client(proxy_url) as client:
         pmcid = await mirror.doi_to_pmcid(doi, client)
         if pmcid:
             res = await _pmcid_to_result(pmcid, doi, user_agent, proxy_url)
@@ -727,8 +731,6 @@ async def _try_mirror_for_url(
     Returns a result dict on success, or None when no better content is found.
     Only called for non-private, non-local URLs after the full httpx/curl_cffi/Jina ladder.
     """
-    from httpx import AsyncClient
-
     doi = mirror.extract_doi(src)
     meta_pdf = None
     if not doi:
@@ -739,7 +741,7 @@ async def _try_mirror_for_url(
             doi = doi or m_doi
     if doi:
         log.info("mirror url %s doi=%s", key, doi)
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with net._client(proxy_url) as client:
         if meta_pdf:
             res = await _candidate_to_result(
                 oa.Candidate(oa._score("citation_pdf_url"), meta_pdf, "citation_pdf_url", kind_hint="pdf"),
@@ -843,9 +845,8 @@ async def _dispatch_one(
                     f"{stripped} is a PMCID but no free full text was found in Europe PMC/PMC. "
                     "Try the `findWorks` tool."), "body": ""}
             if _PMID_RE.match(stripped):
-                from httpx import AsyncClient
                 log.info("routing -> pmid resolver: %s", stripped)
-                async with AsyncClient(proxy=proxy_url) as client:
+                async with net._client(proxy_url) as client:
                     pmcid = await mirror.pmid_to_pmcid(stripped, client)
                 res = await _pmcid_to_result(pmcid, base, user_agent, proxy_url) if pmcid else None
                 if res:

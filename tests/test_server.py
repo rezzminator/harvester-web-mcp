@@ -16,7 +16,7 @@ from pydantic import ValidationError
 
 import harvester.cache as cache_mod
 import harvester.server as srv
-from harvester import convert, detect, dispatch, images, net
+from harvester import convert, detect, dispatch, images, net, oa
 from harvester.cache import split_frontmatter
 from harvester.describe import describe_fetch_result, describe_size_result
 from harvester.tokens import estimate_tokens
@@ -192,6 +192,36 @@ class TestDenyReason:
     def test_refuses_private_key_marker_in_name(self, tmp_path):
         p = tmp_path / "deploy_rsa"
         assert detect.deny_reason(p) is not None
+
+    # --- confinement: system roots + sensitive locations (LFI hardening) ---
+
+    def test_refuses_proc_self_environ(self):
+        # /proc/self/environ leaks the harvester process's whole env (API keys/proxy creds).
+        assert detect.deny_reason(Path("/proc/self/environ")) is not None
+
+    def test_refuses_etc_passwd(self):
+        assert detect.deny_reason(Path("/etc/passwd")) is not None
+
+    def test_refuses_sys_and_dev(self):
+        assert detect.deny_reason(Path("/sys/kernel/notes")) is not None
+        assert detect.deny_reason(Path("/dev/mem")) is not None
+
+    def test_refuses_ssh_id_rsa_under_home(self):
+        assert detect.deny_reason(Path("~/.ssh/id_rsa")) is not None
+
+    def test_refuses_config_gcloud(self):
+        # ~/.config holds gcloud / gh credentials — the working LFI exfil target.
+        assert detect.deny_reason(Path("~/.config/gcloud/credentials.db")) is not None
+
+    def test_refuses_symlink_into_etc(self, tmp_path):
+        # A symlink with an innocent name must not smuggle a system secret past the name checks.
+        link = tmp_path / "report.pdf"
+        try:
+            link.symlink_to("/etc/passwd")
+        except OSError:
+            import pytest as _pytest
+            _pytest.skip("symlinks unsupported on this platform")
+        assert detect.deny_reason(link) is not None
 
     # --- files that MUST be allowed ---
 
@@ -1074,6 +1104,100 @@ class TestIsPrivateHost:
 
     def test_jina_reader_itself(self):
         assert not is_private_host("https://r.jina.ai/https://example.com/")
+
+
+# ── assert_fetchable: the single SSRF/scheme chokepoint ──────────────────────
+
+class TestAssertFetchable:
+    """assert_fetchable rejects non-http(s) schemes, internal hosts, and names that RESOLVE
+    to a private IP (DNS-rebinding) — and allows ordinary public http(s) URLs."""
+
+    async def test_blocks_non_http_schemes(self):
+        for u in ("file:///etc/passwd", "gopher://h/1", "dict://h/x", "ftp://h/f", "data:text/x"):
+            with pytest.raises(net.FetchNotAllowed):
+                await net.assert_fetchable(u)
+
+    async def test_blocks_metadata_loopback_and_internal(self):
+        # All caught lexically (literal IPs / internal TLDs) before any DNS lookup.
+        for u in ("http://169.254.169.254/latest/meta-data/iam/security-credentials/",
+                  "http://127.0.0.1:6379/", "http://[::1]/", "http://node.ts.net/x",
+                  "http://10.1.2.3/", "http://192.168.0.5/", "http://0x7f000001/"):
+            with pytest.raises(net.FetchNotAllowed):
+                await net.assert_fetchable(u)
+
+    async def test_blocks_dns_rebind_to_private(self, monkeypatch):
+        # A public hostname whose A-record points at link-local/RFC-1918 must be refused.
+        monkeypatch.setattr(net.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, "", ("169.254.169.254", 0))])
+        with pytest.raises(net.FetchNotAllowed):
+            await net.assert_fetchable("http://rebind.example.com/")
+
+    async def test_allows_public_host(self, monkeypatch):
+        monkeypatch.setattr(net.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+        await net.assert_fetchable("https://example.com/page")  # must NOT raise
+
+
+# ── SSRF chokepoint on OA candidates (resolve_doi/book + scraped citation_pdf_url) ──
+
+class TestCandidateSsrfGuard:
+    """_candidate_to_result refuses any candidate whose URL is non-http(s) or an internal host,
+    BEFORE any network fetch — covering OA-resolver candidates and the scraped citation_pdf_url."""
+
+    def _block_all_fetch(self, monkeypatch):
+        async def boom_bytes(*a, **k):
+            raise AssertionError("a refused candidate must never reach fetch_bytes_with_meta")
+
+        async def boom_imp(*a, **k):
+            raise AssertionError("a refused candidate must never reach download_impersonated")
+
+        monkeypatch.setattr(net, "fetch_bytes_with_meta", boom_bytes)
+        monkeypatch.setattr(net, "download_impersonated", boom_imp)
+
+    async def test_internal_and_scheme_candidates_refused(self, monkeypatch):
+        self._block_all_fetch(monkeypatch)
+        for url in ("http://169.254.169.254/latest/meta-data/",
+                    "http://127.0.0.1:8080/paper.pdf",
+                    "http://internal.ts.net/paper.pdf",
+                    "file:///etc/passwd",
+                    "gopher://evil/1"):
+            cand = oa.Candidate(0, url, "unpaywall", kind_hint="pdf")
+            assert await dispatch._candidate_to_result(cand, "k", "ua", None) is None, url
+
+    async def test_scraped_citation_pdf_url_to_metadata_refused(self, monkeypatch):
+        # The exact CRITICAL #1 vector: a citation_pdf_url scraped from an attacker page.
+        self._block_all_fetch(monkeypatch)
+        cand = oa.Candidate(0, "http://169.254.169.254/secrets.pdf", "citation_pdf_url",
+                            kind_hint="pdf")
+        assert await dispatch._candidate_to_result(cand, "k", "ua", None) is None
+
+
+# ── SSRF chokepoint across HTTP redirects (per-hop revalidation) ──────────────
+
+class TestRedirectSsrfGuard:
+    """The httpx request event-hook re-validates EVERY hop, so a public URL that 302s to the
+    cloud-metadata endpoint is refused; a fetch primitive converts that refusal to its sentinel."""
+
+    async def test_redirect_to_metadata_is_refused(self, monkeypatch):
+        import httpx
+        monkeypatch.setattr(net.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, "", ("93.184.216.34", 0))])
+
+        def handler(request):
+            if request.url.host == "attacker.example":
+                return httpx.Response(
+                    302, headers={"location": "http://169.254.169.254/latest/meta-data/"})
+            return httpx.Response(200, content=b"INTERNAL-LEAK")
+
+        async with net._client(transport=httpx.MockTransport(handler)) as client:
+            with pytest.raises(net.FetchNotAllowed):
+                await client.get("http://attacker.example/", follow_redirects=True)
+
+    async def test_primitive_returns_sentinel_on_private_resolution(self, monkeypatch):
+        # net.fetch_raw must swallow the refusal and return "" (its resilient contract), not raise.
+        monkeypatch.setattr(net.socket, "getaddrinfo",
+                            lambda *a, **k: [(2, 1, 6, "", ("10.0.0.1", 0))])
+        assert await net.fetch_raw("http://rebind.example.com/", "ua") == ""
 
 
 # ── HTML fetch ladder escalation ─────────────────────────────────────────────

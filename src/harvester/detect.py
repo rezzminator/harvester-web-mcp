@@ -71,29 +71,43 @@ def sniff_magic(head: bytes) -> str | None:
     return None
 
 
-# ── security: refuse secrets/keys on local reads ──────────────────────────────
-_DENY_DIR_PARTS = {".ssh", ".gnupg", ".aws", ".password-store", ".docker"}
+# ── security: confine local reads, refuse secrets/keys ────────────────────────
+# System roots that must never be read regardless of file name — /proc/self/environ leaks the
+# harvester process's entire environment (API keys/proxy creds); /etc holds passwd/shadow; etc.
+_SYSTEM_ROOTS = ("/proc", "/sys", "/dev", "/etc")
+_DENY_DIR_PARTS = {".ssh", ".gnupg", ".aws", ".password-store", ".docker", ".config", ".kube"}
 _DENY_NAMES = {"id_rsa", "id_ed25519", "id_dsa", "id_ecdsa", "credentials",
-               ".netrc", ".pgpass", ".htpasswd", "shadow", "master.key"}
+               ".netrc", ".pgpass", ".htpasswd", "shadow", "master.key",
+               "passwd", ".git-credentials", ".bash_history"}
 _DENY_SUFFIXES = (".pem", ".key", ".p12", ".pfx", ".keystore", ".jks",
                   ".asc", ".gpg", ".kdbx", ".ppk", ".env")
 _DENY_KEY_MARKERS = ("_rsa", "_ed25519", "_dsa", "_ecdsa")
 
 
 def deny_reason(path: Path) -> str | None:
-    """Return a refusal reason if `path` looks like a credential/secret, else None.
+    """Return a refusal reason if reading `path` would expose a secret/system file, else None.
 
-    Conservative: matches whole directory names, whole file names, or file suffixes only —
-    never an arbitrary substring — so ordinary documents pass through untouched.
+    Confinement-minded, not a bare denylist: the path is canonicalized first (expanduser +
+    realpath, resolving symlinks) so a symlink with an innocent name can't smuggle a secret. It is
+    then refused if it resolves (a) into a system root (/proc, /sys, /dev, /etc), (b) inside a
+    sensitive directory (~/.ssh, ~/.aws, ~/.gnupg, ~/.config, ~/.kube, …), or (c) onto a known
+    credential/secret file name or suffix. Ordinary documents pass through untouched.
     """
     try:
-        rp = path.expanduser()
-    except Exception as e:
-        log.warning("deny_reason expanduser failed for %s: %s", path, e)
-        rp = path
+        rp = path.expanduser().resolve()
+    except (OSError, RuntimeError) as e:  # symlink loop / unresolvable → refuse, don't read
+        log.warning("deny_reason could not resolve %s: %s — refusing", path, e)
+        return "refusing to read an unresolvable path"
+    # (a) system roots — checked on the RESOLVED path so a symlink INTO /proc or /etc is caught.
+    rp_str = str(rp)
+    for root in _SYSTEM_ROOTS:
+        if rp_str == root or rp_str.startswith(root + os.sep):
+            return f"refusing to read inside a system directory ({root})"
+    # (b) sensitive directories anywhere in the resolved path
     hit = {p.lower() for p in rp.parts} & _DENY_DIR_PARTS
     if hit:
         return f"refusing to read inside a sensitive directory ({sorted(hit)[0]})"
+    # (c) credential/secret file names + suffixes
     name = rp.name
     low = name.lower()
     if low in _DENY_NAMES:

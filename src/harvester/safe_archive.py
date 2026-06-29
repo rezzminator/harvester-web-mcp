@@ -254,6 +254,28 @@ def read_7z(path: str, name: str) -> bytes:
     except ImportError:
         raise ArchiveError("py7zr package not installed; cannot read .7z archives")
     name = _validate_name(name)
+    # Cap BEFORE extraction: unlike zip/tar (which read only MAX_FILE_BYTES+1 bytes), szf.extract
+    # writes the WHOLE expansion to disk first — a few-KB 7z entry that announces tens of GB would
+    # exhaust the disk before any post-extract size check. Gate on the announced size + ratio here.
+    with py7zr.SevenZipFile(path, mode="r") as szf:
+        info = next((i for i in szf.list()
+                     if unicodedata.normalize("NFC", i.filename) == name), None)
+    if info is None:
+        raise ArchiveError(f"Member not found: {name!r}")
+    if info.is_directory:
+        raise ArchiveError(f"Member is a directory: {name!r}")
+    announced = info.uncompressed or 0
+    if announced > MAX_FILE_BYTES:
+        raise ArchiveError(
+            f"Member {name!r} announced size {announced} "
+            f"exceeds MAX_FILE_BYTES={MAX_FILE_BYTES}"
+        )
+    compressed = info.compressed or 0
+    if compressed > 0 and announced / compressed > MAX_RATIO:
+        raise ArchiveError(
+            f"Member {name!r}: compression ratio {announced / compressed:.0f}x "
+            f"exceeds {MAX_RATIO}x (zip-bomb?)"
+        )
     with tempfile.TemporaryDirectory() as tmpdir:
         with py7zr.SevenZipFile(path, mode="r") as szf:
             szf.extract(targets=[name], path=tmpdir)

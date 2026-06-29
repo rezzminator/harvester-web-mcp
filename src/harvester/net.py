@@ -5,8 +5,9 @@ and an error_kind on failure. httpx and curl_cffi are imported lazily.
 
 import asyncio
 import ipaddress
+import socket
 from typing import Tuple
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import urljoin, urlparse, urlunparse
 
 from .log import get_logger
 
@@ -16,6 +17,19 @@ DEFAULT_USER_AGENT_AUTONOMOUS = "Mozilla/5.0 (compatible; harvester/1.0)"
 DEFAULT_USER_AGENT_MANUAL = "Mozilla/5.0 (compatible; harvester/1.0)"
 
 MAX_DOWNLOAD_BYTES = 50 * 1024 * 1024
+
+# Redirect handling for the curl_cffi paths (httpx follows in-library under the request hook).
+_REDIRECT_CODES = {301, 302, 303, 307, 308}
+_MAX_REDIRECTS = 10
+
+
+class FetchNotAllowed(Exception):
+    """Raised by the SSRF/scheme chokepoint when a URL must not be fetched.
+
+    A non-http(s) scheme, a private/internal host (lexically or after DNS resolution), or an
+    unparseable URL. Every fetch primitive converts this into its own resilient sentinel
+    (""/b""/None) rather than letting it escape.
+    """
 
 HTTP_STATUS_MEANINGS = {
     400: "bad request", 401: "unauthorized", 403: "forbidden", 404: "page not found",
@@ -45,12 +59,15 @@ def _ext_from_content_type(ct: str) -> str:
 
 async def fetch_raw(url: str, user_agent: str, proxy_url: str | None = None) -> str:
     """Fetch the raw page body. Resilient: returns "" on a connection error."""
-    from httpx import AsyncClient, HTTPError
-    async with AsyncClient(proxy=proxy_url) as client:
+    from httpx import HTTPError
+    async with _client(proxy_url) as client:
         try:
             response = await client.get(
                 url, follow_redirects=True, headers={"User-Agent": user_agent}, timeout=30
             )
+        except FetchNotAllowed as e:
+            log.warning("fetch_raw refused %s: %s", url, e)
+            return ""
         except HTTPError as e:
             log.warning("fetch_raw httpx error %s: %s", url, e)
             return ""
@@ -63,13 +80,16 @@ async def fetch_raw_status(
 ) -> Tuple[str, int | None, str | None]:
     """Fetch raw text + diagnostics. Returns (text, http_status, error_kind). Never raises."""
     from httpx import (
-        AsyncClient, ConnectError, HTTPError, InvalidURL, TimeoutException, UnsupportedProtocol,
+        ConnectError, HTTPError, InvalidURL, TimeoutException, UnsupportedProtocol,
     )
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with _client(proxy_url) as client:
         try:
             response = await client.get(
                 url, follow_redirects=True, headers={"User-Agent": user_agent}, timeout=30
             )
+        except FetchNotAllowed as e:
+            log.warning("fetch_raw_status refused %s: %s", url, e)
+            return "", None, "blocked"
         except (InvalidURL, UnsupportedProtocol):
             log.warning("fetch_raw_status invalid url %s", url)
             return "", None, "invalid"
@@ -120,6 +140,9 @@ async def _stream_capped(client, url, user_agent) -> Tuple[bytes, int | None, st
             data = b"".join(chunks)[:MAX_DOWNLOAD_BYTES]
             log.debug("stream %s -> %d (%d bytes, ct=%s)", url, response.status_code, len(data), ct)
             return data, response.status_code, None, ct
+    except FetchNotAllowed as e:
+        log.warning("stream refused %s: %s", url, e)
+        return b"", None, "blocked", ""
     except (InvalidURL, UnsupportedProtocol):
         log.warning("stream invalid url %s", url)
         return b"", None, "invalid", ""
@@ -141,8 +164,7 @@ async def download_bytes(
     url: str, user_agent: str, proxy_url: str | None = None
 ) -> Tuple[bytes, int | None, str | None]:
     """Download binary content (streamed, capped). Returns (data, http_status, error_kind)."""
-    from httpx import AsyncClient
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with _client(proxy_url) as client:
         data, status, error_kind, _ct = await _stream_capped(client, url, user_agent)
         return data, status, error_kind
 
@@ -155,8 +177,7 @@ async def fetch_bytes_with_meta(
     Never raises. Returns (b"", ...) on any error. Exposes Content-Type so callers can detect
     binary documents served at extensionless URLs (e.g. arxiv /pdf/... endpoints).
     """
-    from httpx import AsyncClient
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with _client(proxy_url) as client:
         return await _stream_capped(client, url, user_agent)
 
 
@@ -214,12 +235,39 @@ def looks_like_challenge(html: str) -> bool:
     return False
 
 
+def _ip_is_blocked(addr: "ipaddress._BaseAddress") -> bool:
+    """True if an IP is loopback / RFC-1918 / link-local / reserved / unspecified / multicast —
+    i.e. never a legitimate public fetch target."""
+    return (addr.is_loopback or addr.is_private or addr.is_link_local
+            or addr.is_reserved or addr.is_unspecified or addr.is_multicast)
+
+
+def _host_to_ip(host: str) -> "ipaddress._BaseAddress | None":
+    """Parse *host* as a LITERAL IP — including OBFUSCATED forms (integer 2852039166, hex 0x...,
+    octal) a naive string check misses — or None if it's a name needing DNS resolution."""
+    try:
+        return ipaddress.ip_address(host)  # dotted v4 / bracketless v6
+    except ValueError:
+        try:
+            if host.startswith("0x"):
+                return ipaddress.ip_address(int(host, 16))
+            if host.isdigit():
+                return ipaddress.ip_address(int(host))
+            if "." not in host and ":" not in host and host.startswith("0") and host != "0":
+                return ipaddress.ip_address(int(host, 8))  # octal
+        except (ValueError, OverflowError):
+            return None
+    return None
+
+
 def is_private_host(url: str) -> bool:
-    """Return True if *url* targets a loopback, RFC-1918, link-local, or internal host.
+    """Return True if *url* targets a loopback, RFC-1918, link-local, or internal host (LEXICAL).
 
     Covers: 127.x / ::1 loopback, 10.x / 172.16–31.x / 192.168.x RFC-1918, 169.254.x link-local,
     `.ts.net` / `.local` / `.internal` internal TLDs, and any URL that contains embedded credentials.
-    Private hosts must never be sent to an external proxy like Jina Reader.
+    This is a cheap string-only filter — it does NOT resolve DNS; `assert_fetchable` adds the
+    getaddrinfo check that also defeats DNS-rebinding. Private hosts must never be sent to an
+    external proxy like Jina Reader.
     """
     try:
         parsed = urlparse(url)
@@ -244,26 +292,87 @@ def is_private_host(url: str) -> bool:
     if host in ("localhost", "localhost.localdomain", "ip6-localhost", "ip6-loopback"):
         return True
 
-    # IP address — including OBFUSCATED forms (integer 2852039166, hex 0x..., octal) that
-    # a naive string check misses. Normalise to a real address, then test the ranges.
-    addr = None
-    try:
-        addr = ipaddress.ip_address(host)  # dotted v4 / bracketless v6
-    except ValueError:
-        try:
-            if host.startswith("0x"):
-                addr = ipaddress.ip_address(int(host, 16))
-            elif host.isdigit():
-                addr = ipaddress.ip_address(int(host))
-            elif "." not in host and ":" not in host and host.startswith("0") and host != "0":
-                addr = ipaddress.ip_address(int(host, 8))  # octal
-        except (ValueError, OverflowError):
-            addr = None
+    addr = _host_to_ip(host)
     if addr is not None:
-        return (addr.is_loopback or addr.is_private or addr.is_link_local
-                or addr.is_reserved or addr.is_unspecified or addr.is_multicast)
+        return _ip_is_blocked(addr)
 
     return False
+
+
+def _check_fetchable(url: str) -> None:
+    """Sync core of the SSRF/scheme chokepoint (does a BLOCKING getaddrinfo). Raises
+    `FetchNotAllowed` if *url* is not a safe public http(s) target. See `assert_fetchable`.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception as e:
+        raise FetchNotAllowed(f"unparseable URL {url!r}: {e}")
+
+    scheme = (parsed.scheme or "").lower()
+    if scheme not in ("http", "https"):
+        raise FetchNotAllowed(f"scheme {scheme or '(none)'!r} not allowed (http/https only): {url!r}")
+
+    # Cheap lexical filter first — credentials, internal TLDs, literal/obfuscated private IPs.
+    if is_private_host(url):
+        raise FetchNotAllowed(f"private/internal host refused: {url!r}")
+
+    host = (parsed.hostname or "").lower().strip("[]")
+    if not host:
+        raise FetchNotAllowed(f"no host in URL {url!r}")
+
+    # A literal public IP was already validated by is_private_host — no DNS needed.
+    if _host_to_ip(host) is not None:
+        return
+
+    # Resolve the NAME and reject if ANY address is private — this is what kills DNS-rebinding
+    # (a public hostname whose A/AAAA record points at 169.254.169.254 / 127.0.0.1 / RFC-1918).
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except OSError as e:
+        # Unresolvable — there is nothing to fetch; let the real fetch surface the DNS error
+        # rather than masking it as an SSRF refusal.
+        log.debug("assert_fetchable could not resolve %s: %s", host, e)
+        return
+    for info in infos:
+        ip_str = str(info[4][0]).split("%", 1)[0]  # strip any IPv6 scope id
+        try:
+            addr = ipaddress.ip_address(ip_str)
+        except ValueError:
+            continue
+        if _ip_is_blocked(addr):
+            raise FetchNotAllowed(f"host {host!r} resolves to blocked IP {ip_str}: {url!r}")
+
+
+async def assert_fetchable(url: str) -> None:
+    """The single SSRF/scheme chokepoint. Raises `FetchNotAllowed` unless *url* is a safe public
+    http(s) target:
+
+      * scheme must be http or https (kills file://, gopher://, dict://, …);
+      * the host must not be private/internal lexically (creds, .ts.net/.local/.internal,
+        literal/obfuscated private IPs); and
+      * the host must not RESOLVE (getaddrinfo) to any loopback/private/link-local/reserved/
+        multicast/unspecified address — closing the DNS-rebinding variant.
+
+    Call before every outbound fetch; the httpx request hook re-runs it on each redirect hop.
+    """
+    await asyncio.to_thread(_check_fetchable, url)
+
+
+async def _ssrf_request_hook(request) -> None:
+    """httpx request event-hook — validate the target (and EVERY redirect hop, since httpx fires
+    this for each request in a redirect chain) so a 302 → internal/metadata host is refused."""
+    await assert_fetchable(str(request.url))
+
+
+def _client(proxy_url: str | None = None, **kwargs):
+    """An httpx.AsyncClient with the SSRF request-hook installed on every request + redirect hop.
+
+    Use this instead of constructing AsyncClient directly so no caller can forget the guard.
+    """
+    from httpx import AsyncClient
+    hooks = dict(kwargs.pop("event_hooks", None) or {})
+    hooks["request"] = [*hooks.get("request", []), _ssrf_request_hook]
+    return AsyncClient(proxy=proxy_url, event_hooks=hooks, **kwargs)
 
 
 async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) -> str:
@@ -275,10 +384,10 @@ async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) ->
     if is_private_host(url):
         log.debug("jina skipped private host %s", url)
         return ""
-    from httpx import AsyncClient, HTTPError
+    from httpx import HTTPError
     jina_url = f"https://r.jina.ai/{url}"
     try:
-        async with AsyncClient(proxy=proxy_url) as client:
+        async with _client(proxy_url) as client:
             response = await client.get(
                 jina_url, follow_redirects=True,
                 headers={"User-Agent": user_agent}, timeout=30,
@@ -288,6 +397,9 @@ async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) ->
             return ""
         log.debug("jina %s -> %d (%d chars)", url, response.status_code, len(response.text))
         return _strip_jina_envelope(response.text)
+    except FetchNotAllowed as e:
+        log.warning("jina refused %s: %s", url, e)
+        return ""
     except HTTPError as e:
         log.warning("jina httpx error %s: %s", url, e)
         return ""
@@ -296,66 +408,103 @@ async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) ->
         return ""
 
 
-async def fetch_impersonated(url: str, proxy_url: str | None = None) -> Tuple[str, int | None]:
-    """Fetch with curl_cffi Chrome TLS/JA3 fingerprint impersonation.
+def _cffi_session_kwargs() -> dict:
+    """curl_cffi Session kwargs that lock libcurl to http/https on the initial transfer AND on any
+    redirect — defense-in-depth behind `assert_fetchable`'s scheme gate (blocks file://, gopher://,
+    dict://, … at the libcurl layer)."""
+    try:
+        from curl_cffi import CurlOpt  # type: ignore[import-not-found]
+        return {"curl_options": {CurlOpt.PROTOCOLS_STR: "https,http",
+                                 CurlOpt.REDIR_PROTOCOLS_STR: "https,http"}}
+    except Exception:  # pragma: no cover — older curl_cffi without CurlOpt
+        return {}
 
-    Uses AsyncSession when curl_cffi is installed; falls back to sync get() in a thread.
-    Never raises — returns ("", None) on any failure including missing curl_cffi.
+
+def _impersonated_fetch_sync(url: str, prx, timeout: int):
+    """Sync curl_cffi fallback (no AsyncSession). Manual, bounded, per-hop-validated redirects.
+    Returns the final Response, or None on refusal/failure."""
+    try:
+        import curl_cffi.requests as _cffi  # type: ignore[import-not-found]
+    except ImportError:
+        return None
+    current = url
+    for _ in range(_MAX_REDIRECTS + 1):
+        try:
+            _check_fetchable(current)
+        except FetchNotAllowed as e:
+            log.warning("curl_cffi(sync) refused %s: %s", current, e)
+            return None
+        try:
+            r = _cffi.get(current, impersonate="chrome", proxies=prx, timeout=timeout,
+                          allow_redirects=False)  # type: ignore[arg-type]
+        except Exception as e:
+            log.warning("curl_cffi(sync) failed %s: %s", current, e)
+            return None
+        if r.status_code in _REDIRECT_CODES and r.headers.get("location"):
+            current = urljoin(current, r.headers["location"])
+            continue
+        return r
+    log.warning("curl_cffi(sync) too many redirects %s", url)
+    return None
+
+
+async def _impersonated_fetch(url: str, proxy_url: str | None, timeout: int):
+    """curl_cffi GET that runs `assert_fetchable` on the initial URL and EVERY redirect hop
+    (manual, bounded — curl_cffi auto-follow would skip the per-hop host check), with libcurl
+    protocols locked to http/https. Returns the final Response, or None on refusal/failure.
     """
     # curl_cffi ProxySpec expects {"http": ..., "https": ...} — structurally compatible
     # but pyright cannot verify it without the stubs' TypedDict, so we ignore arg-type below.
     prx = {"https": proxy_url, "http": proxy_url} if proxy_url else None
     try:
         from curl_cffi.requests import AsyncSession  # type: ignore[import-not-found]
-        async with AsyncSession() as session:  # type: ignore[attr-defined]
-            r = await session.get(url, impersonate="chrome", proxies=prx, timeout=45)  # type: ignore[arg-type]
-        log.debug("curl_cffi %s -> %s (%d chars)", url, r.status_code, len(r.text))
-        return r.text, r.status_code
     except ImportError:
-        # Sync fallback via thread
-        try:
-            import curl_cffi.requests as _cffi  # type: ignore[import-not-found]
-            r = await asyncio.to_thread(
-                lambda: _cffi.get(url, impersonate="chrome", proxies=prx, timeout=45)  # type: ignore[arg-type]
-            )
-            log.debug("curl_cffi(sync) %s -> %s", url, r.status_code)
-            return r.text, r.status_code
-        except Exception as e:
-            log.warning("curl_cffi(sync) failed %s: %s", url, e)
-            return "", None
+        return await asyncio.to_thread(_impersonated_fetch_sync, url, prx, timeout)
+    current = url
+    try:
+        async with AsyncSession(**_cffi_session_kwargs()) as session:  # type: ignore[attr-defined]
+            for _ in range(_MAX_REDIRECTS + 1):
+                await assert_fetchable(current)
+                r = await session.get(current, impersonate="chrome", proxies=prx,  # type: ignore[arg-type]
+                                      timeout=timeout, allow_redirects=False)
+                if r.status_code in _REDIRECT_CODES and r.headers.get("location"):
+                    current = urljoin(current, r.headers["location"])
+                    continue
+                return r
+        log.warning("curl_cffi too many redirects %s", url)
+        return None
+    except FetchNotAllowed as e:
+        log.warning("curl_cffi refused %s: %s", current, e)
+        return None
     except Exception as e:
         log.warning("curl_cffi failed %s: %s", url, e)
-        return "", None
+        return None
+
+
+async def fetch_impersonated(url: str, proxy_url: str | None = None) -> Tuple[str, int | None]:
+    """Fetch with curl_cffi Chrome TLS/JA3 fingerprint impersonation.
+
+    Never raises — returns ("", None) on any failure, refusal, or missing curl_cffi. A status of 0
+    (a failed / non-HTTP transfer) is treated as failure, not success.
+    """
+    r = await _impersonated_fetch(url, proxy_url, 45)
+    if r is None or not r.status_code:
+        return "", (r.status_code if r is not None else None) or None
+    log.debug("curl_cffi %s -> %s (%d chars)", url, r.status_code, len(r.text))
+    return r.text, r.status_code
 
 
 async def download_impersonated(url: str, proxy_url: str | None = None) -> Tuple[bytes, int | None]:
     """Download raw bytes with curl_cffi Chrome impersonation (for walled PDFs / CDN assets).
 
-    Never raises — returns (b"", None) on any failure including missing curl_cffi.
+    Never raises — returns (b"", None) on any failure, refusal, or missing curl_cffi. A status of 0
+    (a failed / non-HTTP transfer) and any >=400 are treated as failure.
     """
-    prx = {"https": proxy_url, "http": proxy_url} if proxy_url else None
-    try:
-        from curl_cffi.requests import AsyncSession  # type: ignore[import-not-found]
-        async with AsyncSession() as session:  # type: ignore[attr-defined]
-            r = await session.get(url, impersonate="chrome", proxies=prx, timeout=60)  # type: ignore[arg-type]
-        if r.status_code >= 400:
-            log.warning("curl_cffi download %s -> HTTP %s", url, r.status_code)
-            return b"", r.status_code
-        log.debug("curl_cffi download %s -> %s (%d bytes)", url, r.status_code, len(r.content))
-        return r.content[:MAX_DOWNLOAD_BYTES], r.status_code
-    except ImportError:
-        try:
-            import curl_cffi.requests as _cffi  # type: ignore[import-not-found]
-            r = await asyncio.to_thread(
-                lambda: _cffi.get(url, impersonate="chrome", proxies=prx, timeout=60)  # type: ignore[arg-type]
-            )
-            if r.status_code >= 400:
-                log.warning("curl_cffi(sync) download %s -> HTTP %s", url, r.status_code)
-                return b"", r.status_code
-            return r.content[:MAX_DOWNLOAD_BYTES], r.status_code
-        except Exception as e:
-            log.warning("curl_cffi(sync) download failed %s: %s", url, e)
-            return b"", None
-    except Exception as e:
-        log.warning("curl_cffi download failed %s: %s", url, e)
+    r = await _impersonated_fetch(url, proxy_url, 60)
+    if r is None:
         return b"", None
+    if not r.status_code or r.status_code >= 400:
+        log.warning("curl_cffi download %s -> HTTP %s", url, r.status_code)
+        return b"", r.status_code or None
+    log.debug("curl_cffi download %s -> %s (%d bytes)", url, r.status_code, len(r.content))
+    return r.content[:MAX_DOWNLOAD_BYTES], r.status_code

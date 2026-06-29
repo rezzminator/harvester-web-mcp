@@ -50,12 +50,11 @@ async def localize_html_images(
     if not urls:
         return md
 
-    from httpx import AsyncClient
     mapping: dict[str, str] = {}
     failed = 0
     sem = asyncio.Semaphore(6)
 
-    async with AsyncClient(proxy=proxy_url) as client:
+    async with net._client(proxy_url) as client:
         async def one(u: str) -> None:
             nonlocal failed
             full = urljoin(base_url, u)
@@ -65,6 +64,10 @@ async def localize_html_images(
                         full, follow_redirects=True,
                         headers={"User-Agent": user_agent}, timeout=30,
                     )
+            except net.FetchNotAllowed as e:
+                failed += 1
+                log.warning("image refused (ssrf) %s: %s", full, e)
+                return
             except Exception as e:
                 failed += 1
                 log.warning("image download failed %s: %s", full, e)

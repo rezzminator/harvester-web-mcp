@@ -343,6 +343,24 @@ class TestCapEnforcement:
         with pytest.raises(ArchiveError, match="members"):
             list_archive(str(arc))
 
+    def test_single_file_too_large_announced_refused_early_7z(self, tmp_path, monkeypatch):
+        """read_7z refuses on the announced size BEFORE szf.extract writes the bomb to disk.
+
+        Mirrors test_single_file_too_large_announced_refused_early (zip). Sabotages extract() so
+        the test fails loudly if the cap is enforced post-extraction (the original 7z bug).
+        """
+        monkeypatch.setattr(sa, "MAX_FILE_BYTES", 5)
+        arc = tmp_path / "big.7z"
+        with py7zr.SevenZipFile(str(arc), mode="w") as szf:
+            szf.writef(io.BytesIO(b"x" * 100), "big.txt")
+
+        def boom_extract(self, *a, **k):
+            raise AssertionError("extract() must NOT run — the cap must fire before extraction")
+
+        monkeypatch.setattr(py7zr.SevenZipFile, "extract", boom_extract)
+        with pytest.raises(ArchiveError, match="announced"):
+            read_archive_member(str(arc), "big.txt")
+
 
 # ---------------------------------------------------------------------------
 # 7. Name validation — NUL byte, absolute path, long name
