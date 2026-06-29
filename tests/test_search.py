@@ -96,9 +96,9 @@ class TestBackendSelection:
 
 
 class TestSearchEnabled:
-    """The `search` tool is advertised only when a backend is configured (and not force-disabled)."""
+    """`search_enabled` reports backend availability (can a query actually run?), not visibility."""
 
-    def test_hidden_when_no_backend(self, monkeypatch):
+    def test_disabled_when_no_backend(self, monkeypatch):
         monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
         monkeypatch.setattr(search, "SEARXNG_URL", "")
         monkeypatch.setattr(search, "BRAVE_API_KEY", "")
@@ -121,3 +121,17 @@ class TestSearchEnabled:
         monkeypatch.setattr(search, "BRAVE_API_KEY", "k")
         monkeypatch.setenv("HARVESTER_DISABLE_SEARCH", "1")
         assert search.search_enabled() is False
+
+
+class TestSearchAdvertised:
+    """`search_advertised` governs tool VISIBILITY: always on unless force-disabled."""
+
+    def test_advertised_without_backend(self, monkeypatch):
+        monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
+        monkeypatch.setattr(search, "SEARXNG_URL", "")
+        monkeypatch.setattr(search, "BRAVE_API_KEY", "")
+        assert search.search_advertised() is True
+
+    def test_not_advertised_when_force_disabled(self, monkeypatch):
+        monkeypatch.setenv("HARVESTER_DISABLE_SEARCH", "1")
+        assert search.search_advertised() is False

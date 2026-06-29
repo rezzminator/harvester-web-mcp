@@ -28,17 +28,28 @@ BRAVE_API_KEY = os.environ.get("BRAVE_API_KEY", "")
 _UA = "harvester-mcp/1.0"
 
 
-def search_enabled() -> bool:
-    """Whether the `search` tool should be advertised to the model at all.
+def _force_disabled() -> bool:
+    """True when HARVESTER_DISABLE_SEARCH is set truthy — the operator opt-out for web search."""
+    return os.environ.get("HARVESTER_DISABLE_SEARCH", "").strip().lower() in ("1", "true", "yes", "on")
 
-    Wired to backend availability: the tool appears ONLY when at least one backend is configured
-    (SearXNG and/or Brave). With neither — the default — `search` simply does not show up, so the
-    model never sees a dead "configure me" tool. `HARVESTER_DISABLE_SEARCH=1` force-hides it even
-    when a backend exists.
+
+def search_enabled() -> bool:
+    """Whether the `search` BACKEND can actually run — a backend (SearXNG and/or Brave) is
+    configured and the tool is not force-disabled. Governs call-time behavior, NOT tool visibility:
+    when False the tool is still listed but returns a clear "set SEARXNG_URL/BRAVE_API_KEY" message.
     """
-    if os.environ.get("HARVESTER_DISABLE_SEARCH", "").strip().lower() in ("1", "true", "yes", "on"):
+    if _force_disabled():
         return False
     return bool(SEARXNG_URL or BRAVE_API_KEY)
+
+
+def search_advertised() -> bool:
+    """Whether the `search` tool is LISTED at all. Always advertised so MCP clients (e.g. RR's
+    scout/prospector) see a stable six-tool surface; with no backend a call returns a clear
+    configure-me message rather than the tool vanishing. `HARVESTER_DISABLE_SEARCH=1` force-hides
+    it for deployments that want no web search at all.
+    """
+    return not _force_disabled()
 
 
 async def _searxng(query: str, client: "AsyncClient", count: int, lang: str, engines: str):

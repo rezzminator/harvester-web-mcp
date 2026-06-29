@@ -1472,8 +1472,8 @@ class TestArchiveModel:
 
 
 class TestToolRegistration:
-    async def test_core_tools_always_registered(self, monkeypatch):
-        """With no web-search backend, `search` is hidden; the other five always register."""
+    async def test_all_six_tools_registered_without_backend(self, monkeypatch):
+        """`search` is always advertised — the full six-tool surface shows even with no backend."""
         from harvester import search as _search
 
         async def fake_find_sources(query, limit, proxy=None):
@@ -1483,11 +1483,10 @@ class TestToolRegistration:
         monkeypatch.setattr(_search, "BRAVE_API_KEY", "")
         monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
         tools, _ = await _run_find_tool(monkeypatch, "x", fake_find_sources)
-        assert tools == {"fetch", "findWorks", "fetchImage", "archive", "searchCache"}
-        assert "search" not in tools
+        assert tools == {"fetch", "findWorks", "search", "fetchImage", "archive", "searchCache"}
 
     async def test_search_registered_when_backend_configured(self, monkeypatch):
-        """A configured backend (SearXNG/Brave) makes `search` appear in the tool list."""
+        """A configured backend (SearXNG/Brave) keeps `search` in the tool list."""
         from harvester import search as _search
 
         async def fake_find_sources(query, limit, proxy=None):
@@ -1497,6 +1496,19 @@ class TestToolRegistration:
         monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
         tools, _ = await _run_find_tool(monkeypatch, "x", fake_find_sources)
         assert tools == {"fetch", "findWorks", "search", "fetchImage", "archive", "searchCache"}
+
+    async def test_search_force_hidden(self, monkeypatch):
+        """HARVESTER_DISABLE_SEARCH force-hides `search` even when a backend is configured."""
+        from harvester import search as _search
+
+        async def fake_find_sources(query, limit, proxy=None):
+            return []
+
+        monkeypatch.setattr(_search, "SEARXNG_URL", "http://127.0.0.1:8888")
+        monkeypatch.setenv("HARVESTER_DISABLE_SEARCH", "1")
+        tools, _ = await _run_find_tool(monkeypatch, "x", fake_find_sources)
+        assert tools == {"fetch", "findWorks", "fetchImage", "archive", "searchCache"}
+        assert "search" not in tools
 
 
 class TestSearchModel:

@@ -168,8 +168,9 @@ sample line.
 
 ## Web search
 
-The `search` tool has two backends and is **hidden entirely** unless one is configured (the model
-never sees a dead "configure me" tool).
+The `search` tool has two backends. It is **always advertised** so MCP clients see a stable
+six-tool surface; with no backend configured a call returns a clear "set `SEARXNG_URL` /
+`BRAVE_API_KEY`" message instead of the tool vanishing mid-session.
 
 - **`SEARXNG_URL`** (primary) — base URL of a self-hosted [SearXNG](https://searxng.org)
   (e.g. `http://127.0.0.1:8888`). Free, self-hosted, aggregates 200+ engines (less single-engine /
@@ -177,11 +178,11 @@ never sees a dead "configure me" tool).
   multilingual lever behind the `lang` / `engines` parameters.
 - **`BRAVE_API_KEY`** (managed fallback) — a Brave Search API token, used when SearXNG is
   unconfigured, down, or blocked for a locale.
-- **`HARVESTER_DISABLE_SEARCH`** — set to `1`/`true`/`yes`/`on` to force-hide the `search` tool even
-  when a backend is configured.
+- **`HARVESTER_DISABLE_SEARCH`** — set to `1`/`true`/`yes`/`on` to force-hide the `search` tool
+  entirely, for deployments that want no web search at all.
 
-The tool appears when `SEARXNG_URL` and/or `BRAVE_API_KEY` is set (and `HARVESTER_DISABLE_SEARCH` is
-not truthy). SearXNG is tried first, then Brave.
+The tool runs when `SEARXNG_URL` and/or `BRAVE_API_KEY` is set (SearXNG first, then Brave); it is
+listed regardless unless `HARVESTER_DISABLE_SEARCH` is truthy.
 
 ---
 

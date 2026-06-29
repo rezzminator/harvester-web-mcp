@@ -147,6 +147,40 @@ _HTML_LIKE_CT = frozenset({
 })
 
 
+# ── plain-text vs. HTML routing (for the text bodies _sniff_kind passes through) ──
+# Extensions and Content-Types whose bodies are RAW text — never run them through trafilatura
+# (it assumes markup and strips prose to nothing). HTML CT/extensions are the explicit opposite.
+_PLAIN_TEXT_EXTS = {".txt", ".text", ".md", ".markdown", ".rst", ".log", ".tex", ".org"}
+_PLAIN_TEXT_CTS = {"text/plain", "text/markdown", "text/x-markdown", "text/x-rst"}
+_HTML_CTS = {"text/html", "application/xhtml+xml", "application/xml", "text/xml"}
+# Structural tags that mark a body as real HTML — each needs a literal '<', so plain prose
+# (no angle-bracket tags) never trips them; used only when CT/extension give no verdict.
+_HTML_MARKERS = ("<html", "<!doctype html", "<head", "<body", "<div", "<table",
+                 "<article", "<section", "<span", "<p>", "<p ")
+
+
+def is_plain_text(name: str, content_type: str = "", sample: str = "") -> bool:
+    """True when a text body should be kept VERBATIM rather than run through trafilatura.
+
+    trafilatura expects HTML markup; handed raw prose (a Gutenberg .txt, an OCR dump, a source
+    file, a README) it extracts nothing, so the full document is lost and `size_only` reports 0/0.
+    Decision order: an HTML/XML Content-Type or .htm(l) extension forces extraction; a text/plain|
+    markdown Content-Type or a plain-text extension keeps it verbatim UNLESS the body is obviously
+    mis-served HTML; with no decisive signal, keep it verbatim only when it has no HTML structure.
+    """
+    ct_base = (content_type or "").split(";")[0].strip().lower()
+    low = (sample or "")[:4096].lower()
+    looks_html = any(m in low for m in _HTML_MARKERS)
+    if ct_base in _HTML_CTS:
+        return False
+    ext = os.path.splitext(name.split("?", 1)[0].split("#", 1)[0].lower().rstrip("/"))[1]
+    if ext in (".htm", ".html"):
+        return False
+    if ct_base in _PLAIN_TEXT_CTS or ext in _PLAIN_TEXT_EXTS:
+        return not looks_html  # honor the plain-text signal unless the body is clearly HTML
+    return bool((sample or "").strip()) and not looks_html
+
+
 def _sniff_kind(content_type: str, head: bytes) -> str | None:
     """Return the true non-HTML kind (e.g. 'pdf', 'zip', 'image') from Content-Type +
     magic bytes, or None when the response is genuinely HTML/text.

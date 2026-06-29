@@ -172,7 +172,7 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
 
     if local:
         raw = Path(src).read_text(encoding="utf-8", errors="ignore")
-        http_status, error_kind, challenge = None, None, False
+        http_status, error_kind, challenge, ct = None, None, False, ""
     else:
         data, http_status, error_kind, ct = await net.fetch_bytes_with_meta(src, user_agent, proxy_url)
         # Extensionless URL sniff: if the server returns a binary document (e.g. arxiv PDF),
@@ -183,6 +183,17 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
                 return await _handle_binary_doc(data, src, key, true_kind, user_agent, proxy_url)
         raw = data.decode("utf-8", errors="replace") if data else ""
         challenge = net.looks_like_challenge(raw)
+
+    # (a2) plain text (Gutenberg .txt, OCR dumps, source files, READMEs) is NOT HTML — trafilatura
+    # would strip it to an empty stub (size_only then reports 0/0). Keep it verbatim and cache it,
+    # so the real document survives and a repeat fetch is a cache hit.
+    if raw.strip() and detect.is_plain_text(key, ct, raw):
+        body = raw
+        content_chars = len(body.strip())
+        cache._write_md(md_path, key, "plain-text", body)
+        log.info("plain-text %s chars=%d", key, content_chars)
+        return _ok(md_path, "plain-text", body, content_chars=content_chars,
+                   http_status=http_status, error_kind=error_kind)
 
     # (b) trafilatura extract from the initial response
     body = html.extract_content_from_html(raw)

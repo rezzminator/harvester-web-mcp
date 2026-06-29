@@ -92,12 +92,22 @@ def describe_size_result(item: str, result: "dict | BaseException") -> TextConte
     if isinstance(result, BaseException) or (isinstance(result, dict) and result.get("error")):
         return describe_fetch_result(item, result)
     body = result.get("body") or ""
+    if not body.strip():
+        # Content was fetched but extracted to nothing — never report a silent size 0; surface it
+        # as an explicit error so a scheduler doesn't treat an empty stub as a zero-token document.
+        log.info("size_only %s -> empty body, reporting as error", item)
+        return describe_fetch_result(item, {"error": (
+            f"Fetched {item} but it yielded no readable content (empty after extraction) — "
+            "nothing to size."), "body": ""})
+    tokens = estimate_tokens(body)  # over-counting heuristic; safe to budget against
     payload = {
         "source": item,
-        "size": estimate_tokens(body),  # estimated tokens (over-counting heuristic)
-        "chars": len(body),
+        "size": tokens,         # estimated TOKENS — the budget number a scheduler plans against
+        "tokens": tokens,       # explicit alias of `size`
+        "token_count": tokens,  # matches the `token_count` field written to cache frontmatter
+        "chars": len(body),     # raw character count
         "path": str(result.get("md_path") or ""),
         "cache_status": result.get("cache_status"),
     }
-    log.info("size_only %s -> tokens=%d chars=%d", item, payload["size"], payload["chars"])
+    log.info("size_only %s -> tokens=%d chars=%d", item, tokens, payload["chars"])
     return TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))

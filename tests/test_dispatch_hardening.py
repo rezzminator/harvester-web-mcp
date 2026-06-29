@@ -351,3 +351,72 @@ class TestUnresolvedChallenge:
         assert "error" not in result, result.get("error")
         assert result["method"] == "local-trafilatura"
         assert list(isolated_cache.rglob("*.md")), "genuine content must be cached"
+
+
+# ── plain-text passthrough: .txt / text/plain must NOT be trafilatura-stripped ──
+
+class TestPlainTextPassthrough:
+    """A Gutenberg-style .txt (text/plain) is kept VERBATIM, cached, and a repeat is a cache hit.
+
+    Regression: trafilatura on raw prose returns "", which was cached as an empty 154-byte stub —
+    making `size_only` report 0/0 and every repeat re-download.
+    """
+
+    _BIG_TEXT = ("CHAPTER I\n\n" + ("Napoleon and the war and peace of nations. " * 4000)).encode()
+
+    async def test_plain_text_kept_verbatim_and_cached(self, monkeypatch, isolated_cache):
+        calls = 0
+
+        async def fake_bytes(url, ua, proxy=None):
+            nonlocal calls
+            calls += 1
+            return self._BIG_TEXT, 200, None, "text/plain; charset=utf-8"
+
+        monkeypatch.setattr(net, "fetch_bytes_with_meta", fake_bytes)
+
+        url = "https://www.gutenberg.org/files/2600/2600-0.txt"
+        result = await dispatch._html_result(url, url, False, "ua", None)
+
+        assert "error" not in result, result.get("error")
+        assert result["method"] == "plain-text"
+        # Verbatim: the full text survives (no trafilatura stripping).
+        assert "Napoleon" in result["body"]
+        assert len(result["body"]) >= len(self._BIG_TEXT) - 16  # ~exact (decode only)
+        # Cache file is the real document, not a header-only stub.
+        cached = list(isolated_cache.rglob("*.md"))
+        assert cached and cached[0].stat().st_size > 100_000
+        assert "token_count:" in cached[0].read_text()
+
+        # A repeat is a cache hit — no second download.
+        again = await dispatch._html_result(url, url, False, "ua", None)
+        assert again["cache_status"] == "hit"
+        assert calls == 1, "repeat plain-text fetch must reuse the cache, not re-download"
+
+
+class TestIsPlainText:
+    """detect.is_plain_text routes raw text away from trafilatura, real HTML toward it."""
+
+    def test_text_plain_content_type_is_verbatim(self):
+        from harvester import detect
+        assert detect.is_plain_text("https://x/file", "text/plain; charset=utf-8", "hello") is True
+
+    def test_txt_extension_is_verbatim(self):
+        from harvester import detect
+        assert detect.is_plain_text("https://x/book.txt", "", "plain prose here") is True
+
+    def test_html_content_type_is_extracted(self):
+        from harvester import detect
+        assert detect.is_plain_text("https://x/page", "text/html", "<html><body>hi</body></html>") is False
+
+    def test_html_extension_is_extracted(self):
+        from harvester import detect
+        assert detect.is_plain_text("https://x/page.html", "", "<div>hi</div>") is False
+
+    def test_mis_served_html_as_text_plain_is_extracted(self):
+        from harvester import detect
+        # text/plain but the body is obviously HTML → prefer extraction.
+        assert detect.is_plain_text("https://x/p", "text/plain", "<html><body>x</body></html>") is False
+
+    def test_no_signal_no_structure_is_verbatim(self):
+        from harvester import detect
+        assert detect.is_plain_text("https://x/unknown", "", "just some prose, no tags") is True

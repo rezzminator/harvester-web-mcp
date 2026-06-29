@@ -28,7 +28,7 @@ from .describe import describe_fetch_result, describe_size_result
 from .dispatch import find_sources, get_or_fetch, search_web
 from .log import get_logger
 from .net import DEFAULT_USER_AGENT_AUTONOMOUS
-from .search import search_enabled
+from .search import search_advertised, search_enabled
 
 log = get_logger("server")
 
@@ -284,10 +284,11 @@ Two-step, like `findWorks` → `fetch`: call with NO `member` to get the SAFE me
                 inputSchema=SearchCache.model_json_schema(),
             ),
         ]
-        # The `search` tool is shown only when a backend is configured (SearXNG/Brave). With none
-        # — the default — it is hidden from the model entirely, not offered as a dead "configure
-        # me" tool. HARVESTER_DISABLE_SEARCH=1 force-hides it even when a backend exists.
-        if not search_enabled():
+        # `search` is always advertised so MCP clients (e.g. RR's scout/prospector) get a stable
+        # six-tool surface. With no backend configured a call returns a clear "set SEARXNG_URL/
+        # BRAVE_API_KEY" message rather than the tool vanishing mid-session.
+        # HARVESTER_DISABLE_SEARCH=1 force-hides it for deployments that want no web search at all.
+        if not search_advertised():
             tools = [t for t in tools if t.name != "search"]
         return tools
 

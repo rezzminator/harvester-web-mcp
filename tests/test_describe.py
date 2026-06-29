@@ -70,9 +70,20 @@ class TestDescribeSizeResult:
         assert payload["chars"] == len(body)
         assert payload["size"] == estimate_tokens(body)
         assert payload["size"] == math.ceil(len(body) / 2)  # over-counting heuristic
+        # The token estimate is exposed under explicit aliases too (and matches the frontmatter field).
+        assert payload["tokens"] == payload["size"]
+        assert payload["token_count"] == payload["size"]
         assert payload["path"] == "/tmp/cache/example.md"
         # The body itself is never inlined in a size probe.
         assert "hello world" not in out
+
+    def test_empty_body_reports_error_not_zero(self):
+        # A fetched-but-empty result must never come back as a silent size 0.
+        out = describe_size_result("https://example.com/stub", _ok_result("")).text
+        assert out.startswith("# https://example.com/stub\nERROR")
+        assert "no readable content" in out
+        # No JSON payload with a zero size.
+        assert '"size": 0' not in out
 
     def test_error_dict_falls_back_to_error_rendering(self):
         out = describe_size_result("https://x.example/", {"error": "paywalled", "body": ""}).text
