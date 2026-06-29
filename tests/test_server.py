@@ -1,6 +1,8 @@
 """Tests for the customized fetch MCP server (trafilatura + .fetch cache)."""
 
 import hashlib
+import json
+import math
 import zipfile
 from contextlib import asynccontextmanager
 from pathlib import Path
@@ -16,7 +18,8 @@ import harvester.cache as cache_mod
 import harvester.server as srv
 from harvester import convert, detect, dispatch, images, net
 from harvester.cache import split_frontmatter
-from harvester.describe import describe_fetch_result
+from harvester.describe import describe_fetch_result, describe_size_result
+from harvester.tokens import estimate_tokens
 from harvester.detect import _sniff_kind
 from harvester.html import (
     extract_content_from_html,
@@ -28,7 +31,7 @@ from harvester.net import (
     is_private_host,
     looks_like_challenge,
 )
-from harvester.server import Archive, DownloadImage, Fetch, Find, Search
+from harvester.server import Archive, FetchImage, Fetch, FindWorks, Search
 
 
 # ── fixtures ──────────────────────────────────────────────────────────────────
@@ -86,7 +89,7 @@ class TestDetectKind:
         assert detect.detect_kind("https://api.example.com/v1/items.json") == "json"
 
     def test_zip(self):
-        assert detect.detect_kind("/home/reza/data.zip") == "zip"
+        assert detect.detect_kind("/tmp/data.zip") == "zip"
 
     def test_7z(self):
         assert detect.detect_kind("https://x.com/archive.7z") == "7z"
@@ -630,9 +633,11 @@ def test_describe_thin_guard_uses_content_chars():
     assert out.text.startswith("# https://blocked.example\nERROR")
 
 
-async def _run_fetch_tool(monkeypatch, urls, fake_get_or_fetch):
+async def _run_fetch_tool(monkeypatch, urls, fake_get_or_fetch, *, extra_args=None):
     """Drive the real `fetch` MCP tool end-to-end over in-memory streams, with
-    get_or_fetch monkeypatched so no network is touched. Returns the content list."""
+    get_or_fetch monkeypatched so no network is touched. Returns the content list.
+
+    `extra_args` is merged into the tool call (e.g. {"size_only": True})."""
     monkeypatch.setattr(srv, "get_or_fetch", fake_get_or_fetch)
     async with create_client_server_memory_streams() as (client_streams, server_streams):
         client_read, client_write = client_streams
@@ -647,7 +652,8 @@ async def _run_fetch_tool(monkeypatch, urls, fake_get_or_fetch):
             tg.start_soon(srv.serve)
             async with ClientSession(client_read, client_write) as session:
                 await session.initialize()
-                result = await session.call_tool("fetch", {"sources": urls})
+                call_args = {"sources": urls, **(extra_args or {})}
+                result = await session.call_tool("fetch", call_args)
             tg.cancel_scope.cancel()
         texts: list[str] = []
         for item in result.content:
@@ -820,7 +826,7 @@ class TestDescribeFetchResult:
         assert "truncated: first 1000 of 5000 chars" in tc.text
         # The note must name the real cache path so the source can be flagged as partial.
         assert "/tmp/x.md" in tc.text
-        assert 'grep_cache("<term>")' in tc.text
+        assert 'searchCache("<term>")' in tc.text
 
     def test_under_cap_success_body_is_left_untruncated(self, monkeypatch):
         monkeypatch.setenv("HARVESTER_MAX_INLINE_CHARS", "1000")
@@ -937,6 +943,87 @@ class TestFetchToolBatch:
         assert "good good" in texts[2] and "ERROR" not in texts[2]
 
 
+class TestFetchSizeOnly:
+    """`fetch(size_only=True)`: full content is still cached, but only {size, chars, path} is
+    returned — no body. Errors fall back to the normal error rendering."""
+
+    async def test_size_only_returns_size_and_path_without_body(self, monkeypatch):
+        body = "# Doc\n\n" + ("alpha " * 500)  # Latin prose
+
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            return _result(body, bytes=len(body))
+
+        texts = await _run_fetch_tool(
+            monkeypatch, ["https://a.example/"], fake, extra_args={"size_only": True})
+
+        assert len(texts) == 1
+        payload = json.loads(texts[0])
+        assert payload["chars"] == len(body)
+        assert payload["size"] == math.ceil(len(body) / 2)  # over-counting heuristic
+        assert payload["size"] == estimate_tokens(body)
+        assert payload["path"] == "/tmp/x.md"  # the cache file path for the disk-slice reader
+        # The body itself must NOT be inlined — only its size/path.
+        assert "alpha alpha" not in texts[0]
+
+    async def test_size_only_error_source_falls_back_to_error_rendering(self, monkeypatch):
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            return {"error": "behind a paywall", "body": ""}
+
+        texts = await _run_fetch_tool(
+            monkeypatch, ["https://walled.example/"], fake, extra_args={"size_only": True})
+
+        assert len(texts) == 1
+        assert "ERROR" in texts[0] and "behind a paywall" in texts[0]
+
+    async def test_default_fetch_still_returns_body(self, monkeypatch):
+        body = "# Doc\n\n" + ("beta " * 300)
+
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            return _result(body, bytes=len(body))
+
+        texts = await _run_fetch_tool(monkeypatch, ["https://a.example/"], fake)
+        assert body in texts[0]  # without size_only, the body comes back
+
+
+class TestSizeOnlyReusesCache:
+    """A `size_only` probe writes/reads the SAME cache entry a normal fetch uses — no
+    duplicate file, no poisoned entry. (Dispatch caching is exercised end-to-end here.)"""
+
+    async def test_probe_then_fetch_share_one_cache_file(self, monkeypatch):
+        rich = ("<html><body><article><p>" + ("word " * 400) + "</p></article></body></html>").encode()
+
+        async def fake_bytes(url, ua, proxy=None):
+            return rich, 200, None, "text/html"
+
+        monkeypatch.setattr(net, "fetch_bytes_with_meta", fake_bytes)
+
+        url = "https://example.com/article"
+        # 1) size_only probe — fetches + caches, returns size + path, no body.
+        probe = await dispatch.get_or_fetch(url, "ua", None, media="deny")
+        probe_tc = describe_size_result(url, probe)
+        payload = json.loads(probe_tc.text)
+        assert payload["size"] > 0 and payload["chars"] > 0
+        probe_path = payload["path"]
+
+        # 2) a normal fetch of the same source is a cache HIT on the SAME file.
+        full = await dispatch.get_or_fetch(url, "ua", None, media="deny")
+        assert full["cache_status"] == "hit"
+        assert str(full["md_path"]) == probe_path  # one canonical cache entry, not a duplicate
+        assert "word word" in full["body"]  # the body is intact (probe did not strip it on disk)
+
+
+class TestTokenCountFrontmatter:
+    """`_write_md` records a `token_count` in the YAML frontmatter (the size heuristic)."""
+
+    def test_write_md_records_token_count(self, tmp_path):
+        md_path = tmp_path / "doc.md"
+        body = "word " * 400  # 2000 chars Latin prose
+        cache_mod._write_md(md_path, "https://example.com/x", "local-trafilatura", body)
+        meta, parsed = split_frontmatter(md_path.read_text(encoding="utf-8"))
+        assert int(meta["token_count"]) == estimate_tokens(parsed)
+        assert int(meta["token_count"]) == math.ceil(len(body) / 2)
+
+
 # ── is_private_host ───────────────────────────────────────────────────────────
 
 class TestIsPrivateHost:
@@ -966,7 +1053,7 @@ class TestIsPrivateHost:
         assert is_private_host("http://169.254.1.1/")
 
     def test_tailscale_ts_net(self):
-        assert is_private_host("http://devbox.tail46e8e9.ts.net/")
+        assert is_private_host("http://internal-host.ts.net/")
 
     def test_dot_local(self):
         assert is_private_host("http://printer.local/")
@@ -1180,25 +1267,25 @@ async def _run_find_tool(monkeypatch, query, fake_find_sources):
             async with ClientSession(client_read, client_write) as session:
                 await session.initialize()
                 tools = {t.name for t in (await session.list_tools()).tools}
-                result = await session.call_tool("find", {"query": query})
+                result = await session.call_tool("findWorks", {"query": query})
             tg.cancel_scope.cancel()
         return tools, [c.text for c in result.content if isinstance(c, TextContent)]
 
 
 class TestFindModel:
     def test_defaults(self):
-        f = Find(query="entropy")
+        f = FindWorks(query="entropy")
         assert f.query == "entropy" and f.limit == 8
 
     def test_rejects_bad_limit(self):
         with pytest.raises(ValidationError):
-            Find(query="x", limit=0)
+            FindWorks(query="x", limit=0)
         with pytest.raises(ValidationError):
-            Find(query="x", limit=999)
+            FindWorks(query="x", limit=999)
 
     def test_requires_query(self):
         with pytest.raises(ValidationError):
-            Find()  # type: ignore[call-arg]
+            FindWorks()  # type: ignore[call-arg]
 
 
 class TestRenderFind:
@@ -1227,24 +1314,24 @@ class TestFindToolEndToEnd:
                      "fetch": "10.1/hit", "source": "openalex", "free": "gold", "match": 1.0}]
 
         tools, texts = await _run_find_tool(monkeypatch, "anything", fake_find_sources)
-        assert "find" in tools and "fetch" in tools  # both tools registered
+        assert "findWorks" in tools and "fetch" in tools  # both tools registered
         assert len(texts) == 1
         assert "fetch: 10.1/hit" in texts[0] and "Hit" in texts[0]
 
 
-# ── downloadImage + archive: media split out of fetch ──────────────────────────
+# ── fetchImage + archive: media split out of fetch ──────────────────────────
 
-class TestDownloadImageModel:
+class TestFetchImageModel:
     def test_accepts_list(self):
-        assert DownloadImage(sources=["https://x/a.png"]).sources == ["https://x/a.png"]
+        assert FetchImage(sources=["https://x/a.png"]).sources == ["https://x/a.png"]
 
     def test_rejects_empty(self):
         with pytest.raises(ValidationError):
-            DownloadImage(sources=[])
+            FetchImage(sources=[])
 
     def test_rejects_over_50(self):
         with pytest.raises(ValidationError):
-            DownloadImage(sources=[f"https://x/{i}.png" for i in range(51)])
+            FetchImage(sources=[f"https://x/{i}.png" for i in range(51)])
 
 
 class TestArchiveModel:
@@ -1272,7 +1359,7 @@ class TestToolRegistration:
         monkeypatch.setattr(_search, "BRAVE_API_KEY", "")
         monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
         tools, _ = await _run_find_tool(monkeypatch, "x", fake_find_sources)
-        assert tools == {"fetch", "find", "downloadImage", "archive", "grep_cache"}
+        assert tools == {"fetch", "findWorks", "fetchImage", "archive", "searchCache"}
         assert "search" not in tools
 
     async def test_search_registered_when_backend_configured(self, monkeypatch):
@@ -1285,7 +1372,7 @@ class TestToolRegistration:
         monkeypatch.setattr(_search, "SEARXNG_URL", "http://127.0.0.1:8888")
         monkeypatch.delenv("HARVESTER_DISABLE_SEARCH", raising=False)
         tools, _ = await _run_find_tool(monkeypatch, "x", fake_find_sources)
-        assert tools == {"fetch", "find", "search", "downloadImage", "archive", "grep_cache"}
+        assert tools == {"fetch", "findWorks", "search", "fetchImage", "archive", "searchCache"}
 
 
 class TestSearchModel:

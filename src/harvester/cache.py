@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Tuple
 
 from .log import get_logger
+from .tokens import estimate_tokens
 
 log = get_logger("cache")
 
@@ -95,26 +96,27 @@ def _write_md(md_path: Path, key: str, method: str, body: str) -> None:
         f"fetched_at: {fetched_at}\n"
         "source: harvester\n"
         f"method: {method}\n"
+        f"token_count: {estimate_tokens(body)}\n"
         "---\n\n"
     )
     md_path.write_text(header + body, encoding="utf-8")
     log.debug("cache write %s method=%s chars=%d", md_path, method, len(body))
 
 
-def grep_cache(pattern: str, max_results: int = 50, ignore_case: bool = True) -> list[dict]:
+def search_cache(pattern: str, max_results: int = 50, ignore_case: bool = True) -> list[dict]:
     """Search every cached markdown body under the .fetch tree for `pattern` (regex)."""
     flags = re.IGNORECASE if ignore_case else 0
     try:
         rx = re.compile(pattern, flags)
     except re.error as e:
-        log.warning("grep_cache invalid regex %r: %s", pattern, e)
+        log.warning("search_cache invalid regex %r: %s", pattern, e)
         raise ValueError(f"invalid regex pattern: {e}")
     results: list[dict] = []
     for md in sorted(cache_root().rglob("*.md")):
         try:
             text = md.read_text(encoding="utf-8", errors="ignore")
         except OSError as e:
-            log.warning("grep_cache cannot read %s: %s", md, e)
+            log.warning("search_cache cannot read %s: %s", md, e)
             continue
         _meta, body = split_frontmatter(text)
         hits = rx.findall(body)
@@ -133,5 +135,5 @@ def grep_cache(pattern: str, max_results: int = 50, ignore_case: bool = True) ->
         })
         if len(results) >= max_results:
             break
-    log.info("grep_cache /%s/ -> %d page(s)", pattern, len(results))
+    log.info("search_cache /%s/ -> %d page(s)", pattern, len(results))
     return results

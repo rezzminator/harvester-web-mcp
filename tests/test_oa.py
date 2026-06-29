@@ -384,7 +384,7 @@ class TestDispatchRouting:
 
     async def test_title_prefix_routes_to_find(self):
         r = await dispatch.get_or_fetch('title:"Array programming with NumPy"', "ua", None)
-        assert "error" in r and "find" in r["error"].lower()
+        assert "error" in r and "findworks" in r["error"].lower()
         assert self.captured == []  # a title is NOT fetched/resolved here
 
     async def test_isbn_prefix(self):
@@ -402,7 +402,7 @@ class TestDispatchRouting:
 
     async def test_bare_title_routes_to_find(self):
         r = await dispatch.get_or_fetch("The Selfish Gene by Dawkins", "ua", None)
-        assert "error" in r and "find" in r["error"].lower()
+        assert "error" in r and "findworks" in r["error"].lower()
         assert self.captured == []
 
     async def test_existing_file_is_not_a_title(self, tmp_path, monkeypatch):
@@ -419,7 +419,7 @@ class TestDispatchRouting:
 
     async def test_image_redirects_under_media_deny(self):
         r = await dispatch.get_or_fetch("https://x.example/fig.png", "ua", None, media="deny")
-        assert "error" in r and "downloadImage" in r["error"]
+        assert "error" in r and "fetchImage" in r["error"]
         assert self.captured == []
 
     async def test_archive_redirects_under_media_deny(self):

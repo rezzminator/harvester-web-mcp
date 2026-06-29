@@ -2,6 +2,7 @@
 failure → one clear, descriptive error line.
 """
 
+import json
 import os
 
 from mcp.types import TextContent
@@ -9,6 +10,7 @@ from mcp.types import TextContent
 from .cache import THIN_MIN_CHARS
 from .log import get_logger
 from .net import CONNECTION_ERROR_REASONS, HTTP_STATUS_MEANINGS
+from .tokens import estimate_tokens
 
 log = get_logger("describe")
 
@@ -57,7 +59,7 @@ def describe_fetch_result(item: str, result: "dict | BaseException") -> TextCont
         if cap > 0 and len(body) > cap:
             note = (
                 f"\n\n— [truncated: first {cap} of {len(body)} chars. "
-                f'Full text cached at {result["md_path"]}; use grep_cache("<term>") to search it, '
+                f'Full text cached at {result["md_path"]}; use searchCache("<term>") to search it, '
                 f"or re-fetch a narrower target.]"
             )
             body = body[:cap] + note
@@ -77,3 +79,25 @@ def describe_fetch_result(item: str, result: "dict | BaseException") -> TextCont
         msg = f"Fetched {item} but no readable content could be extracted (JS-rendered or bot-blocked — not retrievable from this datacenter IP)."
     log.info("describe %s -> failure: %s", item, msg)
     return TextContent(type="text", text=f"# {item}\nERROR: {msg}")
+
+
+def describe_size_result(item: str, result: "dict | BaseException") -> TextContent:
+    """Render a `fetch(size_only=True)` probe: NO body — just the size + cache path, as JSON.
+
+    The full content was still fetched and cached (same entry a normal fetch reuses); the probe
+    returns only what a scheduler needs to plan reader windows: `size` (estimated TOKENS via the
+    over-counting heuristic), raw `chars`, and the cache `path` to slice from disk. A failed /
+    walled / thin source falls back to the normal error rendering so it stays visible.
+    """
+    if isinstance(result, BaseException) or (isinstance(result, dict) and result.get("error")):
+        return describe_fetch_result(item, result)
+    body = result.get("body") or ""
+    payload = {
+        "source": item,
+        "size": estimate_tokens(body),  # estimated tokens (over-counting heuristic)
+        "chars": len(body),
+        "path": str(result.get("md_path") or ""),
+        "cache_status": result.get("cache_status"),
+    }
+    log.info("size_only %s -> tokens=%d chars=%d", item, payload["size"], payload["chars"])
+    return TextContent(type="text", text=json.dumps(payload, ensure_ascii=False))

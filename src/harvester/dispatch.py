@@ -11,7 +11,7 @@ import time
 from pathlib import Path
 from urllib.parse import unquote, urlparse
 
-from . import cache, convert, detect, html, images, mirror, net, oa, safe_archive, search
+from . import cache, convert, detect, html, mirror, net, oa, safe_archive, search
 from .cache import CACHE_MIN_BODY, THIN_MIN_CHARS
 from .log import get_logger
 
@@ -241,10 +241,9 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
         return {"error": (f"{key} returned a 'not found / invalid identifier' page — the "
                           "resource does not exist."), "body": ""}
 
-    # (f) image localisation on the winning body, metadata prefix, tidy, cache write
+    # (f) metadata prefix, tidy, cache write. Image refs are LEFT as URLs — `fetch` never
+    # downloads image binaries and never OCRs; the model views one on demand via `fetchImage`.
     meta_block = html.extract_metadata_block(raw)
-    if not local and content_chars:
-        body = await images.localize_html_images(body, src, user_agent, proxy_url)
     if meta_block:
         body = meta_block + body
     body = html.tidy_markdown(body)
@@ -583,7 +582,7 @@ async def _resolve_input(
     return {"error": (
         f"No free, legal full text found for ISBN {value!r} (checked OAPEN, Internet Archive, "
         "Project Gutenberg, and DOAB). It may be an in-copyright book with no open edition — try a "
-        "library, or use the `find` tool with the title to see candidate editions."), "body": ""}
+        "library, or use the `findWorks` tool with the title to see candidate editions."), "body": ""}
 
 
 async def search_web(
@@ -606,9 +605,9 @@ async def find_sources(query: str, limit: int = 8, proxy_url: str | None = None)
         return await oa.find_works(query, client, limit)
 
 
-# A title is ambiguous — `fetch` won't guess which work you mean; it routes you to `find`.
+# A title is ambiguous — `fetch` won't guess which work you mean; it routes you to `findWorks`.
 _FIND_HINT = (
-    "is a title — use the `find` tool to list candidate works (it returns a fetch handle for "
+    "is a title — use the `findWorks` tool to list candidate works (it returns a fetch handle for "
     "each), then fetch the one you pick. `fetch` retrieves locations and UNAMBIGUOUS identifiers "
     "(URL, file path, DOI, ISBN), never a title."
 )
@@ -784,7 +783,7 @@ async def _dispatch_one(
     """Dispatch ONE input (URL or local path, optionally `archive::member`) to its handler
     and return a result dict. Never raises — failures come back as {"error": ...}.
 
-    `media="deny"` (used by the `fetch` tool) redirects images → `downloadImage` and archives →
+    `media="deny"` (used by the `fetch` tool) redirects images → `fetchImage` and archives →
     `archive`, keeping `fetch`'s contract pure (returns document markdown, not a path/listing).
     """
     log.info("get_or_fetch %s media=%s", item, media)
@@ -796,7 +795,7 @@ async def _dispatch_one(
     if not stripped:
         return {"error": 'empty input — pass a URL, a file path, a DOI, an ISBN, or title:"...".', "body": ""}
 
-    # A title is ambiguous — route it to the `find` tool rather than guess which work it means.
+    # A title is ambiguous — route it to the `findWorks` tool rather than guess which work it means.
     if low.startswith("title:"):
         val = stripped[len("title:"):].strip().strip('"').strip("'")
         log.info("routing -> find hint for title: %s", val)
@@ -826,7 +825,7 @@ async def _dispatch_one(
                           "file:// URLs, local paths, DOIs, and ISBNs."), "body": ""}
     else:
         # Not a URL/scheme/DOI. A bare ISBN fetches a book directly; a bare title is ambiguous,
-        # so point it at `find`. Neither fires when the string is an existing local file/path.
+        # so point it at `findWorks`. Neither fires when the string is an existing local file/path.
         if not member and not _path_exists(stripped):
             bare_isbn = oa.normalize_isbn(stripped)
             if bare_isbn:
@@ -842,7 +841,7 @@ async def _dispatch_one(
                     return res
                 return {"error": (
                     f"{stripped} is a PMCID but no free full text was found in Europe PMC/PMC. "
-                    "Try the `find` tool."), "body": ""}
+                    "Try the `findWorks` tool."), "body": ""}
             if _PMID_RE.match(stripped):
                 from httpx import AsyncClient
                 log.info("routing -> pmid resolver: %s", stripped)
@@ -853,7 +852,7 @@ async def _dispatch_one(
                     return res
                 return {"error": (
                     f"{stripped} looks like a PubMed ID but no open-access full text was found "
-                    "(it may be abstract-only or paywalled). Try the `find` tool with the title."),
+                    "(it may be abstract-only or paywalled). Try the `findWorks` tool with the title."),
                     "body": ""}
             if _looks_like_title(stripped):
                 log.info("routing -> find hint for bare title: %s", stripped)
@@ -869,7 +868,7 @@ async def _dispatch_one(
     if not local and _is_pubmed_search_url(src):
         log.info("routing -> find/search hint for pubmed search url: %s", src)
         return {"error": (
-            f"{base} is a PubMed search/results URL, not an article — use the `find` tool (or "
+            f"{base} is a PubMed search/results URL, not an article — use the `findWorks` tool (or "
             "`search`) to get candidate works, each with a fetch handle."), "body": ""}
 
     kind = detect.detect_kind(base)
@@ -903,7 +902,7 @@ async def _dispatch_one(
 
     log.info("dispatch %s kind=%s local=%s member=%r", base, kind, local, member)
     if media == "deny" and (kind == "image" or kind in detect.ARCHIVE_KINDS):
-        tool = "downloadImage" if kind == "image" else "archive"
+        tool = "fetchImage" if kind == "image" else "archive"
         what = "an image" if kind == "image" else f"a {kind} archive"
         log.info("fetch redirect: %s is %s -> %s tool", base, what, tool)
         return {"error": f"{base} is {what} — use the `{tool}` tool, not `fetch`.", "body": ""}

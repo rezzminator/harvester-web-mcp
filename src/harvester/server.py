@@ -1,7 +1,8 @@
-"""The MCP plumbing: the `fetch` / `grep_cache` tools and the `fetch` prompt.
+"""The MCP plumbing: the harvester tools (`fetch`, `findWorks`, `search`, `fetchImage`,
+`archive`, `searchCache`) and the `fetch` prompt.
 
 All the real work lives in focused modules — this file only wires the MCP protocol to
-`dispatch.get_or_fetch`, `describe.describe_fetch_result`, and `cache.grep_cache`.
+`dispatch.get_or_fetch`, `describe.describe_fetch_result`, and `cache.search_cache`.
 """
 
 import asyncio
@@ -22,8 +23,8 @@ from mcp.types import (
 )
 from pydantic import BaseModel, Field
 
-from .cache import grep_cache
-from .describe import describe_fetch_result
+from .cache import search_cache
+from .describe import describe_fetch_result, describe_size_result
 from .dispatch import find_sources, get_or_fetch, search_web
 from .log import get_logger
 from .net import DEFAULT_USER_AGENT_AUTONOMOUS
@@ -44,10 +45,12 @@ class Fetch(BaseModel):
                 "• URL / local path / file:// — web page, PDF, DOCX, XLSX, PPTX, CSV, JSON.\n"
                 "• DOI — a bare DOI (10.xxxx/...), a 'doi:' prefix, or a doi.org URL → a free, legal copy.\n"
                 "• Book by ISBN — isbn:9780262300988 (or a bare ISBN) → a free OA/public-domain copy.\n"
-                "Use a DIFFERENT tool for: a TITLE → `find` (returns candidates to choose from); an "
-                "IMAGE → `downloadImage` (returns a local path to read with vision); a ZIP/TAR/7z/RAR "
+                "Use a DIFFERENT tool for: a TITLE → `findWorks` (returns candidates to choose from); an "
+                "IMAGE → `fetchImage` (returns a local path to read with vision); a ZIP/TAR/7z/RAR "
                 "archive → `archive` (lists members, fetches one). `fetch` returns document markdown — "
                 "pass it a title/image/archive and it points you to the right tool instead of guessing.\n"
+                "Image references in the returned markdown stay as URLs — `fetch` never downloads image "
+                "binaries; to VIEW one, pass its URL to `fetchImage`.\n"
                 "Very large documents may be summarised inline with the full text at the returned cache "
                 "path — read that path if you need everything. Mix kinds in one batch; a failing item "
                 "returns a descriptive per-item error and the rest still return."
@@ -56,9 +59,22 @@ class Fetch(BaseModel):
             max_length=50,
         ),
     ]
+    size_only: Annotated[
+        bool,
+        Field(
+            default=False,
+            description=(
+                "When true, fetch + cache the full content as normal but return NO body — just its "
+                "SIZE and the cache file path: `{size, chars, path}` where `size` is an estimated "
+                "TOKEN count (an over-counting heuristic) and `chars` is the raw character count. Use "
+                "it to probe how big a source is before reading; then slice the cached `path` from "
+                "disk. Reuses the same cache entry a normal fetch would (no duplicate download)."
+            ),
+        ),
+    ]
 
 
-class Find(BaseModel):
+class FindWorks(BaseModel):
     """Parameters for finding candidate works by title / free-text query (the scholarly WebSearch)."""
 
     query: Annotated[
@@ -75,8 +91,8 @@ class Find(BaseModel):
     ]
 
 
-class DownloadImage(BaseModel):
-    """Parameters for downloading one or many images to a local path for vision."""
+class FetchImage(BaseModel):
+    """Parameters for fetching one or many images to a local path for vision."""
 
     sources: Annotated[
         list[str],
@@ -134,8 +150,8 @@ class Search(BaseModel):
     ]
 
 
-class GrepCache(BaseModel):
-    """Parameters for grepping the local fetch cache."""
+class SearchCache(BaseModel):
+    """Parameters for searching the local fetch cache."""
 
     pattern: Annotated[
         str,
@@ -214,58 +230,58 @@ A *source* is either a **location** (where something lives) or an **identity** (
 
 **Locations — fetched directly to document markdown:**
 - Web URL / local path / `file://` → web page, PDF, DOCX, XLSX, PPTX, CSV, or JSON.
-- HTML via trafilatura with image localisation (article images downloaded into `.fetch/<ext>/`, `![](remote)` rewritten to local paths). PDF via pymupdf4llm (extensionless URLs like `arxiv.org/pdf/…` are header-sniffed). DOCX/XLSX/PPTX via Docling, CSV via MarkItDown, JSON pretty-printed. Credential/secret files are refused.
-- An IMAGE → use the `downloadImage` tool. An ARCHIVE (.zip/.tar/.7z/.rar) → use the `archive` tool. `fetch` will redirect you if you pass one here.
+- HTML via trafilatura. Image references stay as URLs in the markdown — `fetch` never downloads image binaries and never OCRs; to VIEW an image, pass its URL to `fetchImage`, which returns a local path to read with vision. PDF via pymupdf4llm (extensionless URLs like `arxiv.org/pdf/…` are header-sniffed). DOCX/XLSX/PPTX via Docling, CSV via MarkItDown, JSON pretty-printed. Credential/secret files are refused.
+- An IMAGE → use the `fetchImage` tool. An ARCHIVE (.zip/.tar/.7z/.rar) → use the `archive` tool. `fetch` will redirect you if you pass one here.
 
 **Identities — resolved to a free, legal copy, then converted:**
 - **DOI** — `10.xxxx/…`, `doi:…`, or a `doi.org` URL.
 - **Book by ISBN** — `isbn:9780262300988` (or a bare ISBN).
 Harvester runs the legal open-access chain — for papers: Unpaywall → OpenAlex → Semantic Scholar → Europe PMC → CORE → DOAJ (arXiv & OSF/SocArXiv resolve by DOI prefix); for books: OAPEN → Internet Archive → Project Gutenberg → DOAB — returning the first copy that yields real content. Only API-sanctioned sources; no shadow libraries.
-**Have only a TITLE?** Titles are ambiguous, so `fetch` won't guess — call the **`find`** tool first (it lists candidate works), then fetch the one you choose by its DOI/URL.
+**Have only a TITLE?** Titles are ambiguous, so `fetch` won't guess — call the **`findWorks`** tool first (it lists candidate works), then fetch the one you choose by its DOI/URL.
 
 **Wall-bypass — when ANY URL is blocked, it goes down the rabbit hole:** httpx → curl_cffi Chrome-impersonation → Jina Reader → then it extracts the DOI from the page/URL (or a `citation_pdf_url` meta tag) and runs the open-access chain → Wayback Machine. So a paywalled or bot-blocked publisher link still returns the open copy when one legally exists. Hard IP-reputation blocks need a residential exit — the server says so plainly.
 
-**Sibling tools:** `search` (open-web search → URLs to fetch), `find` (a title → candidate works to choose from), `downloadImage` (an image → a local path to read with vision), `archive` (browse a .zip/.tar/.7z/.rar), `grep_cache` (search what you already fetched).
+**Sibling tools:** `search` (open-web search → URLs to fetch), `findWorks` (a title → candidate works to choose from), `fetchImage` (an image → a local path to read with vision), `archive` (browse a .zip/.tar/.7z/.rar), `searchCache` (search what you already fetched).
 
-Returns the FULL content of every source in the SAME order. Each result: a short header (source, cache_status, method, bytes, cache path) then the content. A failing source yields a descriptive per-item error; the rest still return.""",
+Returns the FULL content of every source in the SAME order. Each result: a short header (source, cache_status, method, bytes, cache path) then the content. A failing source yields a descriptive per-item error; the rest still return. Set `size_only: true` to get just `{size, chars, path}` per source (full content still cached) — probe a source's size, then slice the cached path from disk.""",
                 inputSchema=Fetch.model_json_schema(),
             ),
             Tool(
-                name="find",
+                name="findWorks",
                 description="""Find scholarly papers and books by TITLE or free-text query — the scholarly counterpart of WebSearch. Returns a RANKED LIST of candidate works (papers + books), each with a ready-to-use `fetch:` handle; it does NOT download anything.
 
-Use it whenever you have a TITLE or a fuzzy description rather than a URL / DOI / ISBN — `fetch` deliberately won't guess which work a title means, so `find` shows you the matches and you choose. Each result lists: title · authors · year · kind (paper|book) · source · free-access status · a `fetch:` handle (a DOI, an `isbn:` string, or a direct URL). Then call `fetch` with the handle of the one you want.
+Use it whenever you have a TITLE or a fuzzy description rather than a URL / DOI / ISBN — `fetch` deliberately won't guess which work a title means, so `findWorks` shows you the matches and you choose. Each result lists: title · authors · year · kind (paper|book) · source · free-access status · a `fetch:` handle (a DOI, an `isbn:` string, or a direct URL). Then call `fetch` with the handle of the one you want.
 
-Two-step pattern, exactly like WebSearch → WebFetch: **find → fetch**. (Papers come from OpenAlex; books from Open Library + Project Gutenberg.)""",
-                inputSchema=Find.model_json_schema(),
+Two-step pattern, exactly like WebSearch → WebFetch: **findWorks → fetch**. (Papers come from OpenAlex; books from Open Library + Project Gutenberg.)""",
+                inputSchema=FindWorks.model_json_schema(),
             ),
             Tool(
                 name="search",
                 description="""Search the open web — a stronger, privacy-respecting replacement for the built-in WebSearch. Returns ranked results (title · URL · snippet · engine); pick the URLs you want and retrieve them with `fetch`.
 
-Backed by a self-hosted **SearXNG** that aggregates 200+ engines (less single-engine/SEO bias than a plain Google search), with the **Brave** Search API as fallback. It returns links + snippets to TRIAGE, not full content — that's `fetch`'s job (search → fetch, like find → fetch).
+Backed by a self-hosted **SearXNG** that aggregates 200+ engines (less single-engine/SEO bias than a plain Google search), with the **Brave** Search API as fallback. It returns links + snippets to TRIAGE, not full content — that's `fetch`'s job (search → fetch, like findWorks → fetch).
 
 **Multilingual:** set `lang` (e.g. `zh`, `ja`, `pt-BR`) to route the query to that language's native engines — the way to reach Chinese / Japanese / Brazilian / etc. web results that an English search never surfaces. Optionally restrict to specific `engines`.""",
                 inputSchema=Search.model_json_schema(),
             ),
             Tool(
-                name="downloadImage",
-                description="""Download one or many images and return their LOCAL FILE PATHS to read with your vision — figures, photos, charts, scanned pages. Each `sources` item is an image URL or a local image path; the bytes are saved under `.fetch/<ext>/` and the path returned in order.
+                name="fetchImage",
+                description="""Fetch one or many images and return their LOCAL FILE PATHS to read with your vision — figures, photos, charts, scanned pages. Each `sources` item is an image URL or a local image path; the bytes are saved under `.fetch/<ext>/` and the path returned in order.
 
-Images are NOT OCR'd or turned into text — you OPEN the returned path with your vision to see the content (a chart or photo carries information no caption can). Use this instead of `fetch` whenever the thing is a picture; `fetch` returns document markdown and will point you here for an image.""",
-                inputSchema=DownloadImage.model_json_schema(),
+Images are NOT OCR'd or turned into text — you OPEN the returned path with your vision to see the content (a chart or photo carries information no caption can). Use this instead of `fetch` whenever the thing is a picture; `fetch` returns document markdown (image refs left as URLs) and will point you here for an image.""",
+                inputSchema=FetchImage.model_json_schema(),
             ),
             Tool(
                 name="archive",
                 description="""Safely browse a single archive — `.zip` / `.tar(.gz/.bz2/.xz)` / `.7z` / `.rar` — given by URL or local path.
 
-Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member listing (names + sizes; nothing is extracted to disk). Then call again with one `member` name from that listing to fetch just that member, converted to Markdown. Path-traversal and symlink members are refused, member-count/size caps are enforced, and the archive is never auto-extracted. Use this instead of `fetch` for any archive.""",
+Two-step, like `findWorks` → `fetch`: call with NO `member` to get the SAFE member listing (names + sizes; nothing is extracted to disk). Then call again with one `member` name from that listing to fetch just that member, converted to Markdown. Path-traversal and symlink members are refused, member-count/size caps are enforced, and the archive is never auto-extracted. Use this instead of `fetch` for any archive.""",
                 inputSchema=Archive.model_json_schema(),
             ),
             Tool(
-                name="grep_cache",
+                name="searchCache",
                 description="""Search every page already cached under `.fetch/` for a regex `pattern`, returning the source URLs/paths whose content matches (with match counts + a sample line). Recall what you have already fetched without re-crawling.""",
-                inputSchema=GrepCache.model_json_schema(),
+                inputSchema=SearchCache.model_json_schema(),
             ),
         ]
         # The `search` tool is shown only when a backend is configured (SearXNG/Brave). With none
@@ -287,13 +303,13 @@ Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member 
 
     @server.call_tool()
     async def call_tool(name, arguments: dict) -> list[TextContent]:
-        if name == "grep_cache":
+        if name == "searchCache":
             try:
-                gargs = GrepCache(**arguments)
+                gargs = SearchCache(**arguments)
             except ValueError as e:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
             try:
-                matches = grep_cache(gargs.pattern, gargs.max_results, gargs.ignore_case)
+                matches = search_cache(gargs.pattern, gargs.max_results, gargs.ignore_case)
             except ValueError as e:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
             if not matches:
@@ -305,13 +321,13 @@ Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member 
                     lines.append(f"    {m['sample']}")
             return [TextContent(type="text", text="\n".join(lines))]
 
-        if name == "find":
+        if name == "findWorks":
             try:
-                fargs = Find(**arguments)
+                fargs = FindWorks(**arguments)
             except ValueError as e:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
             cands = await find_sources(fargs.query, fargs.limit, proxy_url)
-            log.info("find tool: %r -> %d candidate(s)", fargs.query, len(cands))
+            log.info("findWorks tool: %r -> %d candidate(s)", fargs.query, len(cands))
             return [TextContent(type="text", text=_render_find(fargs.query, cands))]
 
         if name == "search" and not search_enabled():
@@ -329,12 +345,12 @@ Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member 
                      len(results) if results else 0, backend)
             return [TextContent(type="text", text=_render_search(sargs.query, results, backend))]
 
-        if name == "downloadImage":
+        if name == "fetchImage":
             try:
-                iargs = DownloadImage(**arguments)
+                iargs = FetchImage(**arguments)
             except ValueError as e:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
-            log.info("downloadImage tool: %d source(s)", len(iargs.sources))
+            log.info("fetchImage tool: %d source(s)", len(iargs.sources))
             sem = asyncio.Semaphore(8)
 
             async def dl_one(u: str) -> dict:
@@ -359,7 +375,7 @@ Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member 
         except ValueError as e:
             raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
 
-        log.info("fetch tool: %d source(s)", len(args.sources))
+        log.info("fetch tool: %d source(s) size_only=%s", len(args.sources), args.size_only)
         sem = asyncio.Semaphore(8)
 
         async def fetch_one(u: str) -> dict:
@@ -367,7 +383,9 @@ Two-step, like `find` → `fetch`: call with NO `member` to get the SAFE member 
                 return await get_or_fetch(u, user_agent_autonomous, proxy_url, media="deny")
 
         results = await asyncio.gather(*(fetch_one(u) for u in args.sources), return_exceptions=True)
-        return [describe_fetch_result(u, r) for u, r in zip(args.sources, results)]
+        # size_only: full content is still fetched + cached, but return only {size, chars, path}.
+        render = describe_size_result if args.size_only else describe_fetch_result
+        return [render(u, r) for u, r in zip(args.sources, results)]
 
     @server.get_prompt()
     async def get_prompt(name: str, arguments: dict | None) -> GetPromptResult:

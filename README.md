@@ -52,7 +52,7 @@ message when it applies.
 
 | Input | Converter | Cache subdir |
 |---|---|---|
-| Web page / HTML | trafilatura (`favor_recall`, images localised) | `.fetch/html/` |
+| Web page / HTML | trafilatura (`favor_recall`; image refs kept as URLs) | `.fetch/html/` |
 | PDF URL or file (header-sniffed for extensionless URLs) | pymupdf4llm | `.fetch/pdf/` |
 | DOCX, XLSX, PPTX | Docling | `.fetch/docx/` `.fetch/xlsx/` `.fetch/pptx/` |
 | CSV | MarkItDown | `.fetch/csv/` |
@@ -62,9 +62,9 @@ message when it applies.
 | Archive member (`source::path/to/member`) | routed by member extension | `.fetch/archive_member/` |
 | Local path or `file://` URL | same routing, no network | same tree |
 
-**Image localisation:** trafilatura extracts `![](remote-url)` links; each image is downloaded
-concurrently (cap: 50 images, 10 MB each) into `.fetch/<ext>/` and the link is rewritten to the
-local path, making figures readable by vision tools.
+**Images:** `fetch` never downloads image binaries and never OCRs — `![](remote-url)` references
+are left as URLs in the Markdown. To VIEW a figure, pass its URL to the `fetchImage` tool, which
+saves the bytes locally and returns a path readable by vision tools.
 
 **Header-sniff routing:** content-type and magic bytes override the URL extension, so
 `https://arxiv.org/pdf/1706.03762` (no `.pdf`) is correctly routed to pymupdf4llm. A `.pdf` URL
@@ -92,16 +92,21 @@ Converts one or many **sources** to clean Markdown, returned in input order with
   `isbn:9780262300988` or a bare ISBN). Identifiers are resolved to a free, legal copy and then
   converted. Mix kinds in one batch; a failing item returns a descriptive per-item error and the
   rest still return.
+- `size_only` (boolean, optional, default **false**) — when true, fetch + cache the full content as
+  normal but return only `{size, chars, path}` per source (`size` = estimated TOKENS via an
+  over-counting heuristic, `chars` = raw character count, `path` = cache file). Reuses the same
+  cache entry a normal fetch would (no duplicate download); slice the cached `path` from disk.
 
-`fetch` returns document Markdown only. Pass it an image, an archive, or a bare title and it points
-you at the right sibling tool (`downloadImage`, `archive`, `find`) instead of guessing. Each result
-carries a short header (source, cache_status, method, bytes, cache path) followed by the content.
+`fetch` returns document Markdown only (image references left as URLs). Pass it an image, an archive,
+or a bare title and it points you at the right sibling tool (`fetchImage`, `archive`, `findWorks`)
+instead of guessing. Each result carries a short header (source, cache_status, method, bytes, cache
+path) followed by the content.
 
-### `find`
+### `findWorks`
 
 The scholarly counterpart of web search: a TITLE or free-text bibliographic query → a ranked list
 of candidate works (papers + books), each with a ready-to-use `fetch:` handle. It downloads
-nothing — you pick a candidate and pass its handle to `fetch` (the `find → fetch` pattern). Papers
+nothing — you pick a candidate and pass its handle to `fetch` (the `findWorks → fetch` pattern). Papers
 come from OpenAlex; books from Open Library + Project Gutenberg.
 
 - `query` (string, **required**) — a paper/book title or free-text query.
@@ -121,9 +126,9 @@ An open-web search — title · URL · snippet · engine — to triage; retrieve
 
 **Backends (see [Web search](#web-search)):** the tool is shown only when a backend is configured.
 
-### `downloadImage`
+### `fetchImage`
 
-Downloads one or many images and returns their LOCAL FILE PATHS to read with vision — figures,
+Fetches one or many images and returns their LOCAL FILE PATHS to read with vision — figures,
 photos, charts, scanned pages. Images are saved, not OCR'd; open the returned path to see the
 content.
 
@@ -134,7 +139,7 @@ content.
 ### `archive`
 
 Safely browses a single archive — `.zip` / `.tar(.gz/.bz2/.xz)` / `.7z` / `.rar` — by URL or local
-path. Two-step, like `find → fetch`.
+path. Two-step, like `findWorks → fetch`.
 
 - `source` (string, **required**) — URL or local path of the archive.
 - `member` (string, optional, default `null`) — omit to get the SAFE member listing (names + sizes;
@@ -142,7 +147,7 @@ path. Two-step, like `find → fetch`.
   converted to Markdown. Path-traversal and symlink members are refused; member-count/size caps are
   enforced; the archive is never auto-extracted.
 
-### `grep_cache`
+### `searchCache`
 
 Searches every page already cached under `.fetch/` for a regex pattern — recall what you have
 already fetched without re-crawling. Returns matching source URLs/paths with match counts and a

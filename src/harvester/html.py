@@ -14,8 +14,9 @@ log = get_logger("html")
 def extract_content_from_html(html: str) -> str:
     """Extract the main content of an HTML page as Markdown via trafilatura.
 
-    include_images=True emits ``![]()`` links for article images so that
-    localize_html_images can download them and rewrite the links to local paths.
+    include_images=True emits ``![]()`` links for article images. `fetch` leaves these as
+    remote URLs — it never downloads image binaries; the model views one on demand via the
+    `fetchImage` tool.
     """
     return trafilatura.extract(
         html, output_format="markdown", favor_recall=True,

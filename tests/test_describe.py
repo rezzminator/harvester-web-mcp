@@ -1,8 +1,15 @@
 """Tests for harvester.describe — the inline-body cap and its truncation note (FIX P0)."""
 
+import json
+import math
 from pathlib import Path
 
-from harvester.describe import DEFAULT_MAX_INLINE_CHARS, describe_fetch_result
+from harvester.describe import (
+    DEFAULT_MAX_INLINE_CHARS,
+    describe_fetch_result,
+    describe_size_result,
+)
+from harvester.tokens import estimate_tokens
 
 
 def _ok_result(body: str, *, content_chars: int | None = None) -> dict:
@@ -26,10 +33,10 @@ class TestInlineCap:
         out = describe_fetch_result("https://example.com/big", _ok_result(body)).text
         # The full body must NOT be inlined.
         assert body not in out
-        # The truncation note names the cap, the true length, the md_path, and grep_cache.
+        # The truncation note names the cap, the true length, the md_path, and searchCache.
         assert f"first {DEFAULT_MAX_INLINE_CHARS} of {len(body)} chars" in out
         assert "/tmp/cache/example.md" in out
-        assert "grep_cache" in out
+        assert "searchCache" in out
 
     def test_body_under_cap_is_returned_unchanged(self):
         body = "word " * 200  # 1000 chars: over THIN_MIN_CHARS, under the cap
@@ -50,3 +57,29 @@ class TestInlineCap:
         out = describe_fetch_result("https://example.com/full", _ok_result(body)).text
         assert body in out
         assert "truncated" not in out
+
+
+class TestDescribeSizeResult:
+    """`fetch(size_only=True)` rendering: {size, chars, path} as JSON, NO body."""
+
+    def test_success_returns_size_chars_path_no_body(self):
+        body = "hello world " * 200  # Latin prose
+        out = describe_size_result("https://example.com/big", _ok_result(body)).text
+        payload = json.loads(out)
+        assert payload["source"] == "https://example.com/big"
+        assert payload["chars"] == len(body)
+        assert payload["size"] == estimate_tokens(body)
+        assert payload["size"] == math.ceil(len(body) / 2)  # over-counting heuristic
+        assert payload["path"] == "/tmp/cache/example.md"
+        # The body itself is never inlined in a size probe.
+        assert "hello world" not in out
+
+    def test_error_dict_falls_back_to_error_rendering(self):
+        out = describe_size_result("https://x.example/", {"error": "paywalled", "body": ""}).text
+        assert out.startswith("# https://x.example/\nERROR")
+        assert "paywalled" in out
+
+    def test_exception_falls_back_to_error_rendering(self):
+        out = describe_size_result("https://x.example/", ConnectionError("reset by peer")).text
+        assert "ERROR" in out
+        assert "ConnectionError" in out

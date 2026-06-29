@@ -191,7 +191,7 @@ class TestPmidPmcidRouting:
         result = await dispatch.get_or_fetch("30220343", "ua")
         assert "error" in result
         assert "PubMed ID" in result["error"]
-        assert "find" in result["error"]
+        assert "findWorks" in result["error"]
         assert "local file not found" not in result["error"]
 
     async def test_pmcid_routes_as_pmcid(self, monkeypatch):
@@ -213,7 +213,7 @@ class TestPmidPmcidRouting:
         result = await dispatch.get_or_fetch("PMC99999999", "ua")
         assert "error" in result
         assert "PMCID" in result["error"]
-        assert "find" in result["error"]
+        assert "findWorks" in result["error"]
 
     async def test_pmcid_lowercase_is_recognised(self, monkeypatch):
         seen = []
@@ -251,7 +251,7 @@ class TestPubmedSearchUrl:
         result = await dispatch.get_or_fetch(
             "https://pubmed.ncbi.nlm.nih.gov/?term=glp1+weight", "ua")
         assert "error" in result
-        assert "find" in result["error"] and "search" in result["error"].lower()
+        assert "findWorks" in result["error"] and "search" in result["error"].lower()
 
 
 # ── P4b: favicon / icon skip ────────────────────────────────────────────────────
