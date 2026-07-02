@@ -1,0 +1,41 @@
+{
+  "schema": 1,
+  "version": "0.40.0",
+  "installed_from_tag": "v0.40.0",
+  "installed_at": "2026-07-02T00:00:00Z",
+  "updated_at": null,
+  "install_profile": "scoped",
+  "interview": {
+    "project_name": "harvester",
+    "project_pitch": "Multi-format MCP fetch + search server: URL/path/scholarly-ID → clean Markdown, with a wall-bypass ladder and a type-partitioned cache.",
+    "character_name": "none (session) / Dr. House (in /pcm)",
+    "character_voice": "none",
+    "sacred_ground": "secrets / credential files; the SSRF (assert_fetchable) and LFI (deny_reason) guards; stdout-is-JSON-RPC",
+    "structure": "single",
+    "subprojects": [{ "dir": ".", "desc": "harvester-mcp Python MCP server", "pkg": "uv" }],
+    "tech_commands": {
+      ".": {
+        "test": "uv run pytest -q",
+        "lint": "uv run ruff check .",
+        "typecheck": "uv run pyright src/",
+        "build": "skip",
+        "dev": "uv run harvester"
+      }
+    },
+    "installed_commands": ["pcm", "quality:prompt"],
+    "not_installed": ["build", "wave", "jc", "quality:doc", "pcm:update", "pcm:release", "agents", "worktrees", "codex"],
+    "codex": false
+  },
+  "files": {
+    "CLAUDE.md": "sha256:44635bb97d6978db81ce339c172b4542b9be3035123261652429ba55b9fa588f",
+    ".claude/settings.json": "sha256:5e439b7b0e839855d93a6c76272fac1394930741ea66bd7da22032d514fae49f",
+    ".claude/commands/pcm.md": "sha256:baaaf389e3eea43aba3609346844eb1c82b48d254a24a7511ce2c201b091131c",
+    ".claude/commands/quality/prompt.md": "sha256:a2120c6902ad9b0062f97cd7ca821cbc45372194583049f44b6e1da0401d3fe0",
+    ".claude/output-styles/dr-house.md": "sha256:b12900f96bdec46759ed48281e8d43318797fc308e877c1e5220d277603372cb",
+    ".claude/scripts/pcm-guard.sh": "sha256:7273febb1cc66fca387a5fee466e28c0823f2c2bf132defcbabe573795a86c08",
+    ".claude/scripts/format-md.sh": "sha256:46ec881db7121da30d0bbb49f045f750ebb301248ba043bdad839a1693402b40",
+    ".professor/VERSION": "sha256:3019bdb106d042ba1f7cf88d1dd844530076d5ff49f6b88e48316a3e1e05d9da",
+    ".professor/drift.md": "sha256:c5c12c477b4d1cadce71574fec23b13ce1b65424ea12fbf5548686d4192bb791",
+    ".professor/decisions.md": "sha256:5476bcc1d2739d2f4b0ffc3b17f803e880856913d8e4c1dae1e24150e7112665"
+  }
+}
