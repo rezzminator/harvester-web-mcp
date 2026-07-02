@@ -40,20 +40,23 @@ class Fetch(BaseModel):
         list[str],
         Field(
             description=(
-                "1–50 things to fetch, each returned as clean Markdown in the SAME order with its "
-                "FULL content. Each is a LOCATION or an UNAMBIGUOUS identifier of a DOCUMENT:\n"
+                "1–50 things to fetch, each returned as clean Markdown in the SAME order. Each is "
+                "a LOCATION or an UNAMBIGUOUS identifier of a DOCUMENT:\n"
                 "• URL / local path / file:// — web page, PDF, DOCX, XLSX, PPTX, CSV, JSON.\n"
                 "• DOI — a bare DOI (10.xxxx/...), a 'doi:' prefix, or a doi.org URL → a free, legal copy.\n"
                 "• Book by ISBN — isbn:9780262300988 (or a bare ISBN) → a free OA/public-domain copy.\n"
+                "• PMID / PMCID — a bare PubMed ID (e.g. 30220343) or a PMC accession (PMC1234567) "
+                "→ resolved via Europe PMC/PMC.\n"
                 "Use a DIFFERENT tool for: a TITLE → `findWorks` (returns candidates to choose from); an "
                 "IMAGE → `fetchImage` (returns a local path to read with vision); a ZIP/TAR/7z/RAR "
                 "archive → `archive` (lists members, fetches one). `fetch` returns document markdown — "
                 "pass it a title/image/archive and it points you to the right tool instead of guessing.\n"
                 "Image references in the returned markdown stay as URLs — `fetch` never downloads image "
                 "binaries; to VIEW one, pass its URL to `fetchImage`.\n"
-                "Very large documents may be summarised inline with the full text at the returned cache "
-                "path — read that path if you need everything. Mix kinds in one batch; a failing item "
-                "returns a descriptive per-item error and the rest still return."
+                "Content past the inline cap is truncated with a note naming the cache file — the "
+                "COMPLETE text is always saved there, whether or not the inline copy was cut. Mix "
+                "kinds in one batch; a failing item returns a descriptive per-item error and the "
+                "rest still return."
             ),
             min_length=1,
             max_length=50,
@@ -236,6 +239,7 @@ A *source* is either a **location** (where something lives) or an **identity** (
 **Identities — resolved to a free, legal copy, then converted:**
 - **DOI** — `10.xxxx/…`, `doi:…`, or a `doi.org` URL.
 - **Book by ISBN** — `isbn:9780262300988` (or a bare ISBN).
+- **PMID / PMCID** — a bare PubMed ID (e.g. `30220343`) or a PMC accession (`PMC1234567`), resolved via Europe PMC/PMC.
 Harvester runs the legal open-access chain — for papers: Unpaywall → OpenAlex → Semantic Scholar → Europe PMC → CORE → DOAJ (arXiv & OSF/SocArXiv resolve by DOI prefix); for books: OAPEN → Internet Archive → Project Gutenberg → DOAB — returning the first copy that yields real content. Only API-sanctioned sources; no shadow libraries.
 **Have only a TITLE?** Titles are ambiguous, so `fetch` won't guess — call the **`findWorks`** tool first (it lists candidate works), then fetch the one you choose by its DOI/URL.
 
@@ -243,7 +247,7 @@ Harvester runs the legal open-access chain — for papers: Unpaywall → OpenAle
 
 **Sibling tools:** `search` (open-web search → URLs to fetch), `findWorks` (a title → candidate works to choose from), `fetchImage` (an image → a local path to read with vision), `archive` (browse a .zip/.tar/.7z/.rar), `searchCache` (search what you already fetched).
 
-Returns the FULL content of every source in the SAME order. Each result: a short header (source, cache_status, method, bytes, cache path) then the content. A failing source yields a descriptive per-item error; the rest still return. Set `size_only: true` to get just `{size, chars, path}` per source (full content still cached) — probe a source's size, then slice the cached path from disk.""",
+Returns the content of every source in the SAME order. Each result: a short header (source, cache_status, method, bytes, tokens, fetched_at, cache path) then the content — content past the inline cap is truncated with a note, but the cache path always holds the COMPLETE text. A failing source yields a descriptive per-item error naming what to try next; the rest still return. Set `size_only: true` to get just `{size, chars, path}` per source (full content still cached) — probe a source's size, then slice the cached path from disk.""",
                 inputSchema=Fetch.model_json_schema(),
             ),
             Tool(
@@ -280,7 +284,7 @@ Two-step, like `findWorks` → `fetch`: call with NO `member` to get the SAFE me
             ),
             Tool(
                 name="searchCache",
-                description="""Search every page already cached under `.fetch/` for a regex `pattern`, returning the source URLs/paths whose content matches (with match counts + a sample line). Recall what you have already fetched without re-crawling.""",
+                description="""Search every page already cached under `.fetch/` for a regex `pattern`, returning WHICH cached pages match — source URL, match count, a sample line, and the cached `md_path` — not their text. Recall what you have already fetched without re-crawling; to read a match's content, `fetch` the source again (served from cache) or read `md_path` directly from disk.""",
                 inputSchema=SearchCache.model_json_schema(),
             ),
         ]
@@ -314,10 +318,15 @@ Two-step, like `findWorks` → `fetch`: call with NO `member` to get the SAFE me
             except ValueError as e:
                 raise McpError(ErrorData(code=INVALID_PARAMS, message=str(e)))
             if not matches:
-                return [TextContent(type="text", text=f"No cached pages match /{gargs.pattern}/.")]
-            lines = [f"{len(matches)} cached page(s) match /{gargs.pattern}/:", ""]
+                return [TextContent(type="text", text=(
+                    f"No cached pages match /{gargs.pattern}/. This only searches pages already "
+                    "fetched — it does not search the web; use `search` or `fetch` a source first."
+                ))]
+            lines = [f"{len(matches)} cached page(s) match /{gargs.pattern}/ — this lists WHICH "
+                     "pages match, it does not return their text; `fetch` the source or read "
+                     "`md_path` directly for content:", ""]
             for m in matches:
-                lines.append(f"- {m['url']}  ({m['matches']} matches)")
+                lines.append(f"- {m['url']}  ({m['matches']} matches)  md_path: {m['md_path']}")
                 if m["sample"]:
                     lines.append(f"    {m['sample']}")
             return [TextContent(type="text", text="\n".join(lines))]
@@ -393,11 +402,14 @@ Two-step, like `findWorks` → `fetch`: call with NO `member` to get the SAFE me
         if not arguments or "url" not in arguments:
             raise McpError(ErrorData(code=INVALID_PARAMS, message="URL is required"))
         url = arguments["url"]
-        result = await get_or_fetch(url, user_agent_autonomous, proxy_url)
-        content = result.get("body") or f"<error>{result.get('error', 'extraction was empty')}</error>"
+        # Same contract as the `fetch` tool: media="deny" (redirect images/archives to their own
+        # tools) and describe_fetch_result rendering (header + status/kind diagnostics on failure),
+        # so the prompt path never loses information the tool path keeps.
+        result = await get_or_fetch(url, user_agent_autonomous, proxy_url, media="deny")
+        rendered = describe_fetch_result(url, result)
         return GetPromptResult(
             description=f"Contents of {url}",
-            messages=[PromptMessage(role="user", content=TextContent(type="text", text=content))],
+            messages=[PromptMessage(role="user", content=rendered)],
         )
 
     options = server.create_initialization_options()

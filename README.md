@@ -40,7 +40,11 @@ as it gets rich content:
 
 PDF/Office/archive downloads share the spirit of the ladder: an empty or 403 download is retried
 with curl_cffi impersonation, and a walled publisher PDF URL that carries an extractable DOI pivots
-to the open-access mirror before giving up.
+to the open-access mirror before giving up. A `.pdf` URL that serves an HTML wall page instead of a
+PDF is not a dead end either: the (already-downloaded) HTML is scraped for a `citation_pdf_url` /
+`citation_doi` tag and that candidate is tried before the mirror chain; a PDF that downloads fine
+but converts to empty text (scanned/corrupt) also pivots to the mirror chain before erroring, on
+the theory that a bad copy at one URL doesn't mean no open-access copy exists anywhere.
 
 Hard IP-reputation blocks (publisher DRM, a paywall requiring authentication) are not solvable
 without a residential exit node — that is out of scope, and the server surfaces a clear error
@@ -59,7 +63,7 @@ message when it applies.
 | JSON | literal pretty-print in a ` ```json ``` ` block | `.fetch/json/` |
 | Image (JPG/PNG/GIF/WebP/BMP/SVG/TIFF) | saved locally, path returned for vision | `.fetch/<ext>/` |
 | Archive (.zip / .tar(.gz/.bz2/.xz) / .7z / .rar) | safe listing, member on request | `.fetch/<kind>/` |
-| Archive member (`source::path/to/member`) | routed by member extension | `.fetch/archive_member/` |
+| Archive member — call `archive(source, member="path/to/member")` (internally addressed `source::member`) | routed by member extension | `.fetch/archive_member/` |
 | Local path or `file://` URL | same routing, no network | same tree |
 
 **Images:** `fetch` never downloads image binaries and never OCRs — `![](remote-url)` references
@@ -84,14 +88,14 @@ below).
 
 ### `fetch`
 
-Converts one or many **sources** to clean Markdown, returned in input order with full content.
+Converts one or many **sources** to clean Markdown, returned in input order.
 
 - `sources` (array of strings, **required**, 1–50 items) — each item is a **location** (web URL,
   local path, or `file://` URL → web page / PDF / DOCX / XLSX / PPTX / CSV / JSON) or an
   **unambiguous identifier** (a DOI as `10.xxxx/…`, `doi:…`, or a `doi.org` URL; a book as
-  `isbn:9780262300988` or a bare ISBN). Identifiers are resolved to a free, legal copy and then
-  converted. Mix kinds in one batch; a failing item returns a descriptive per-item error and the
-  rest still return.
+  `isbn:9780262300988` or a bare ISBN; a PMID or PMCID). Identifiers are resolved to a free, legal
+  copy and then converted. Mix kinds in one batch; a failing item returns a descriptive per-item
+  error naming the next tool/argument to try, and the rest still return.
 - `size_only` (boolean, optional, default **false**) — when true, fetch + cache the full content as
   normal but return only `{size, chars, path}` per source (`size` = estimated TOKENS via an
   over-counting heuristic, `chars` = raw character count, `path` = cache file). Reuses the same
@@ -99,8 +103,10 @@ Converts one or many **sources** to clean Markdown, returned in input order with
 
 `fetch` returns document Markdown only (image references left as URLs). Pass it an image, an archive,
 or a bare title and it points you at the right sibling tool (`fetchImage`, `archive`, `findWorks`)
-instead of guessing. Each result carries a short header (source, cache_status, method, bytes, cache
-path) followed by the content.
+instead of guessing. Each result carries a short header (source, cache_status, method, bytes,
+tokens, fetched_at, cache path) followed by the content. Content past
+`HARVESTER_MAX_INLINE_CHARS` is truncated inline with a note naming the cache path and the char
+offset to resume from — the cache file always holds the COMPLETE text, truncated or not.
 
 ### `findWorks`
 
@@ -150,8 +156,9 @@ path. Two-step, like `findWorks → fetch`.
 ### `searchCache`
 
 Searches every page already cached under `.fetch/` for a regex pattern — recall what you have
-already fetched without re-crawling. Returns matching source URLs/paths with match counts and a
-sample line.
+already fetched without re-crawling. It locates WHICH cached pages match; it does not return their
+text. Returns each hit's source URL, match count, a sample line, and the cached `md_path` — `fetch`
+the source again (served from cache) or read `md_path` directly for the content.
 
 - `pattern` (string, **required**) — regex pattern.
 - `max_results` (integer, optional, default **50**, range 1–1000) — maximum matching pages.
@@ -161,8 +168,10 @@ sample line.
 
 ## Prompts
 
-- `fetch` — fetch a URL or local path and return its full extracted Markdown. Argument: `url`
-  (required).
+- `fetch` — fetch a URL or local path and return its extracted Markdown, rendered the same way as
+  the `fetch` tool (header + truncation note on success, a descriptive error naming the next move
+  on failure). Argument: `url` (required). Images/archives redirect to `fetchImage`/`archive`,
+  same as the tool.
 
 ---
 
@@ -220,8 +229,20 @@ overridable with `WEBFETCH_DIR`. Every artifact is type-partitioned:
 
 Slugs are filesystem-safe and suffixed with a 10-char SHA-1 of the input for collision safety.
 Failing fetches are held in a short-lived in-memory negative cache (default 120 s, see
-`HARVESTER_NEG_TTL`) so a dead source is not re-hammered; concurrent calls for the same input share
+`HARVESTER_NEG_TTL`) so a dead source is not re-hammered; a repeat call inside the window returns
+the same error annotated with the seconds remaining before a retry is worth attempting. A
+transient failure (timeout, connection error, or an HTTP 429) instead gets the much shorter
+`HARVESTER_NEG_TTL_TRANSIENT` window, since it's likely to clear up on its own soon. A DOI-type
+input is canonicalized before it hits the cache, so a bare DOI, a `doi:` prefix, and a
+`https://doi.org/…` URL for the same work share one entry instead of each independently
+re-running (and re-failing) the same open-access chain. Concurrent calls for the same input share
 a single in-flight fetch.
+
+A successful fetch that needed more than one rescue attempt (e.g. the initial request was
+walled and curl_cffi impersonation or the open-access mirror chain won instead) records which
+rungs were tried in the cache frontmatter and the result header (`rungs: direct,
+chrome-impersonation, ...`); a terminal error names every rung it walked before giving up, so a
+dead source's error is itself the evidence that re-fetching won't help.
 
 ---
 
@@ -296,6 +317,7 @@ To relocate the cache and enable web search, pass environment variables:
 | `WEBFETCH_DIR` | `.fetch/` at project root | Relocate the on-disk cache. |
 | `HARVESTER_MAX_INLINE_CHARS` | `50000` | Cap on the Markdown returned inline per source; the cache file always holds the full text (read the returned path for everything). |
 | `HARVESTER_NEG_TTL` | `120` | Seconds a failed fetch is remembered in the negative cache. |
+| `HARVESTER_NEG_TTL_TRANSIENT` | `15` | Shorter negative-cache TTL for a transient failure (timeout, connection error, HTTP 429). |
 | `HARVESTER_PDF_OCR` | off | Run Tesseract OCR on image-only PDF pages (slow; off by default for fast text-layer extraction). |
 | `HARVESTER_PDF_LAYOUT` | off | Run the pymupdf4llm layout model for higher table/heading fidelity (slow). |
 | `HARVESTER_LOG_FILE` | unset | Write logs to this file. |

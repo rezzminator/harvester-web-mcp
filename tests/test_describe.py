@@ -4,6 +4,7 @@ import json
 import math
 from pathlib import Path
 
+from harvester import cache as cache_mod
 from harvester.describe import (
     DEFAULT_MAX_INLINE_CHARS,
     describe_fetch_result,
@@ -37,6 +38,18 @@ class TestInlineCap:
         assert f"first {DEFAULT_MAX_INLINE_CHARS} of {len(body)} chars" in out
         assert "/tmp/cache/example.md" in out
         assert "searchCache" in out
+
+    def test_truncation_note_is_truthful_no_summarised_no_dead_recovery(self):
+        """The note must claim COMPLETE (not "summarised") text at the cache path, name the
+        char offset to resume from, and state plainly that searchCache finds pages, not text —
+        it must NOT suggest "re-fetch a narrower target" (that recovery path does nothing)."""
+        body = "A" * (DEFAULT_MAX_INLINE_CHARS + 10_000)
+        out = describe_fetch_result("https://example.com/big", _ok_result(body)).text
+        assert "COMPLETE text is at" in out
+        assert f"read that file from char {DEFAULT_MAX_INLINE_CHARS}" in out
+        assert "does not return text" in out
+        assert "summarised" not in out.lower()
+        assert "re-fetch a narrower target" not in out
 
     def test_body_under_cap_is_returned_unchanged(self):
         body = "word " * 200  # 1000 chars: over THIN_MIN_CHARS, under the cap
@@ -94,3 +107,68 @@ class TestDescribeSizeResult:
         out = describe_size_result("https://x.example/", ConnectionError("reset by peer")).text
         assert "ERROR" in out
         assert "ConnectionError" in out
+
+
+class TestHeaderEnrichment:
+    """The result header gains `tokens` and `fetched_at`, read from the cache frontmatter that
+    `cache._write_md` already writes — never re-derived so it can't drift from what's on disk."""
+
+    def test_header_includes_tokens_and_fetched_at_from_real_frontmatter(self, tmp_path):
+        md_path = tmp_path / "doc.md"
+        body = "word " * 400  # 2000 chars
+        cache_mod._write_md(md_path, "https://example.com/x", "local-trafilatura", body)
+        meta, written_body = cache_mod.split_frontmatter(md_path.read_text(encoding="utf-8"))
+
+        # describe_fetch_result reads md_path off the result dict — point it at the real file.
+        result = _ok_result(written_body)
+        result["md_path"] = md_path
+        out = describe_fetch_result("https://example.com/x", result).text
+
+        assert f"tokens: {meta['token_count']}" in out
+        assert f"fetched_at: {meta['fetched_at']}" in out
+
+    def test_header_falls_back_gracefully_with_no_frontmatter(self, tmp_path):
+        """A cache artifact with no frontmatter (e.g. an image path) must not blow up the
+        header — tokens fall back to a fresh estimate, fetched_at to "unknown"."""
+        body = "word " * 50
+        result = _ok_result(body)
+        result["md_path"] = tmp_path / "does-not-exist.png"
+        out = describe_fetch_result("https://example.com/img", result).text
+        assert f"tokens: {estimate_tokens(body)}" in out
+        assert "fetched_at: unknown" in out
+
+
+class TestFailureMessageNamesNextMove:
+    """Every terminal error the model sees must name a concrete next tool/argument — Slice 1
+    deliverable 7. describe.py derives these through the shared `net.failure_message` helper."""
+
+    def test_invalid_url_names_search(self):
+        out = describe_fetch_result(
+            "not a url", _ok_result("", content_chars=0) | {"http_status": None, "error_kind": "invalid"}
+        ).text
+        assert "Invalid URL" in out
+        assert "`search`" in out
+
+    def test_connection_error_names_search(self):
+        result = _ok_result("", content_chars=0) | {"http_status": None, "error_kind": "timeout"}
+        out = describe_fetch_result("https://slow.example/", result).text
+        assert "timed out" in out.lower()
+        assert "`search`" in out
+
+    def test_challenge_names_search(self):
+        result = _ok_result("", content_chars=0) | {"http_status": 200, "challenge": True}
+        out = describe_fetch_result("https://walled.example/", result).text
+        assert "challenge" in out.lower()
+        assert "`search`" in out
+
+    def test_http_404_names_search_or_findworks(self):
+        result = _ok_result("tiny", content_chars=4) | {"http_status": 404}
+        out = describe_fetch_result("https://x.example/missing", result).text
+        assert "HTTP 404" in out
+        assert "`search`" in out and "`findWorks`" in out
+
+    def test_thin_extraction_names_search_and_findworks(self):
+        result = _ok_result("", content_chars=0) | {"http_status": 200}
+        out = describe_fetch_result("https://js-only.example/", result).text
+        assert "no readable content" in out.lower()
+        assert "`search`" in out and "`findWorks`" in out

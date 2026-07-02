@@ -87,9 +87,34 @@ def split_frontmatter(text: str) -> Tuple[dict, str]:
     return meta, body.lstrip("\n")
 
 
-def _write_md(md_path: Path, key: str, method: str, body: str) -> None:
-    """Write a markdown artifact with a small YAML provenance header."""
+def read_frontmatter(md_path: str | Path) -> dict:
+    """Read just the YAML frontmatter of a cached artifact, without loading the whole body.
+
+    Used by `describe.py` to enrich a result header with `tokens` / `fetched_at` straight from
+    what `_write_md` already recorded. Returns `{}` (never raises) when the path doesn't exist,
+    isn't readable as text, or carries no frontmatter block — callers must tolerate a missing
+    key (non-`.md` cache artifacts like images/archives have no frontmatter at all).
+    """
+    try:
+        with open(md_path, "r", encoding="utf-8", errors="ignore") as fh:
+            head = fh.read(4096)  # the frontmatter block is always tiny; never read a huge body
+    except OSError as e:
+        log.debug("read_frontmatter cannot read %s: %s", md_path, e)
+        return {}
+    meta, _body = split_frontmatter(head)
+    return meta
+
+
+def _write_md(md_path: Path, key: str, method: str, body: str, extra: "dict[str, str] | None" = None) -> None:
+    """Write a markdown artifact with a small YAML provenance header.
+
+    `extra` adds optional additional frontmatter fields (e.g. `{"rungs": "direct, jina"}` — the
+    Slice 2 rescue-graph trace) without changing the shape of an artifact that has none: existing
+    readers (`split_frontmatter`/`read_frontmatter`) already parse arbitrary `key: value` lines,
+    so old artifacts with no `extra` are byte-identical to before.
+    """
     fetched_at = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    extra_lines = "".join(f"{k}: {v}\n" for k, v in (extra or {}).items())
     header = (
         "---\n"
         f"url: {key}\n"
@@ -97,6 +122,7 @@ def _write_md(md_path: Path, key: str, method: str, body: str) -> None:
         "source: harvester\n"
         f"method: {method}\n"
         f"token_count: {estimate_tokens(body)}\n"
+        f"{extra_lines}"
         "---\n\n"
     )
     md_path.write_text(header + body, encoding="utf-8")

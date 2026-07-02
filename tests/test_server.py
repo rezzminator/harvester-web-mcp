@@ -470,6 +470,37 @@ class TestArchiveMemberDispatch:
         assert "file1.txt" in body
         assert "file2.txt" in body
 
+    async def test_listing_teaches_archive_tool_call_not_double_colon(self, tmp_path):
+        """The listing must teach `archive(source=..., member=...)` — the form `fetch` accepts
+        — never the internal `source::member` addressing, which `fetch` refuses outright."""
+        arc = tmp_path / "z.zip"
+        with zipfile.ZipFile(arc, "w") as zf:
+            zf.writestr("a.txt", "hi")
+
+        result = await dispatch.get_or_fetch(str(arc), "test-ua", None)
+        body = result.get("body", "")
+        assert "archive(source=" in body and "member=" in body
+        assert f"{arc}::" not in body
+
+
+# ── empty-input error must not advertise the always-failing title:"..." form ────
+
+class TestEmptyInputError:
+    """`fetch("")` must point at `findWorks` for titles, not advertise `title:"..."` — that
+    form always errors (titles are ambiguous; `fetch` never guesses)."""
+
+    async def test_empty_string_points_at_findworks_not_title_syntax(self):
+        result = await dispatch.get_or_fetch("", "test-ua", None)
+        assert "error" in result
+        assert "findWorks" in result["error"]
+        assert 'title:"' not in result["error"]
+
+    async def test_whitespace_only_points_at_findworks_not_title_syntax(self):
+        result = await dispatch.get_or_fetch("   ", "test-ua", None)
+        assert "error" in result
+        assert "findWorks" in result["error"]
+        assert 'title:"' not in result["error"]
+
 
 # ── _image_result ──────────────────────────────────────────────────────────────
 
@@ -854,9 +885,14 @@ class TestDescribeFetchResult:
         # ...but the first `cap` chars and a truncation note must.
         assert "x" * 1000 in tc.text
         assert "truncated: first 1000 of 5000 chars" in tc.text
-        # The note must name the real cache path so the source can be flagged as partial.
+        # The note must name the real cache path so the source can be flagged as partial, tell
+        # the model the file holds the COMPLETE text (not "summarised"), name the char offset to
+        # resume reading from, and be honest that searchCache locates pages, not text.
         assert "/tmp/x.md" in tc.text
-        assert 'searchCache("<term>")' in tc.text
+        assert "COMPLETE text is at" in tc.text
+        assert "read that file from char 1000" in tc.text
+        assert "searchCache" in tc.text and "does not return text" in tc.text
+        assert "summarised" not in tc.text.lower()
 
     def test_under_cap_success_body_is_left_untruncated(self, monkeypatch):
         monkeypatch.setenv("HARVESTER_MAX_INLINE_CHARS", "1000")
@@ -1511,6 +1547,48 @@ class TestToolRegistration:
         assert "search" not in tools
 
 
+async def _list_tools_raw(monkeypatch):
+    """Drive the server's `list_tools` over in-memory streams, returning the raw `Tool` objects
+    (name + description + inputSchema) — what a model actually reads, unlike the name-only set
+    `_run_find_tool` returns."""
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        client_read, client_write = client_streams
+        server_read, server_write = server_streams
+
+        @asynccontextmanager
+        async def fake_stdio():
+            yield server_read, server_write
+
+        monkeypatch.setattr(srv, "stdio_server", fake_stdio)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(srv.serve)
+            async with ClientSession(client_read, client_write) as session:
+                await session.initialize()
+                tools = (await session.list_tools()).tools
+            tg.cancel_scope.cancel()
+        return tools
+
+
+class TestFetchToolDescriptionTruth:
+    """Slice 1 deliverables 1 + 3: the `fetch` tool schema must document PMID/PMCID inputs and
+    must not contain the "summarised" / shouty "FULL content" contradictions."""
+
+    async def test_mentions_pmid_and_pmcid(self, monkeypatch):
+        tools = await _list_tools_raw(monkeypatch)
+        fetch_tool = next(t for t in tools if t.name == "fetch")
+        sources_desc = fetch_tool.inputSchema["properties"]["sources"]["description"]
+        assert "PMID" in fetch_tool.description
+        assert "PMID" in sources_desc and "PMCID" in sources_desc
+
+    async def test_no_summarised_or_shouty_full_content_claim(self, monkeypatch):
+        tools = await _list_tools_raw(monkeypatch)
+        fetch_tool = next(t for t in tools if t.name == "fetch")
+        sources_desc = fetch_tool.inputSchema["properties"]["sources"]["description"]
+        combined = fetch_tool.description + sources_desc
+        assert "summarised" not in combined.lower()
+        assert "FULL content" not in combined
+
+
 class TestSearchModel:
     def test_defaults(self):
         s = Search(query="x")
@@ -1534,3 +1612,114 @@ class TestRenderSearch:
 
     def test_empty(self):
         assert "No results" in srv._render_search("q", [], "brave")
+
+
+# ── `searchCache` tool: gains an `md_path` field per hit ─────────────────────────
+
+async def _run_searchcache_tool(monkeypatch, pattern, fake_search_cache, *, extra_args=None):
+    """Drive the real `searchCache` MCP tool end-to-end over in-memory streams."""
+    monkeypatch.setattr(srv, "search_cache", fake_search_cache)
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        client_read, client_write = client_streams
+        server_read, server_write = server_streams
+
+        @asynccontextmanager
+        async def fake_stdio():
+            yield server_read, server_write
+
+        monkeypatch.setattr(srv, "stdio_server", fake_stdio)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(srv.serve)
+            async with ClientSession(client_read, client_write) as session:
+                await session.initialize()
+                call_args = {"pattern": pattern, **(extra_args or {})}
+                result = await session.call_tool("searchCache", call_args)
+            tg.cancel_scope.cancel()
+        return [c.text for c in result.content if isinstance(c, TextContent)]
+
+
+class TestSearchCacheTool:
+    """Slice 1 deliverable 4: `searchCache` output gains an `md_path` field per hit — cache.py
+    already computes it, this pins that the SERVER RENDERING actually surfaces it."""
+
+    async def test_hits_include_md_path(self, monkeypatch):
+        def fake_search_cache(pattern, max_results, ignore_case):
+            return [{"url": "https://x.example/a", "md_path": "/tmp/.fetch/html/a__deadbeef00.md",
+                     "matches": 2, "sample": "hello world"}]
+
+        texts = await _run_searchcache_tool(monkeypatch, "hello", fake_search_cache)
+        assert len(texts) == 1
+        assert "https://x.example/a" in texts[0]
+        assert "/tmp/.fetch/html/a__deadbeef00.md" in texts[0]
+        assert "md_path" in texts[0]
+
+    async def test_no_matches_names_next_move(self, monkeypatch):
+        def fake_search_cache(pattern, max_results, ignore_case):
+            return []
+
+        texts = await _run_searchcache_tool(monkeypatch, "nope", fake_search_cache)
+        assert "No cached pages match" in texts[0]
+        assert "`search`" in texts[0] or "`fetch`" in texts[0]
+
+
+# ── the `fetch` prompt: same rendering + media contract as the `fetch` tool ──────
+
+async def _run_fetch_prompt(monkeypatch, url, fake_get_or_fetch):
+    """Drive the real `fetch` MCP prompt end-to-end over in-memory streams, with
+    get_or_fetch monkeypatched so no network is touched."""
+    monkeypatch.setattr(srv, "get_or_fetch", fake_get_or_fetch)
+    async with create_client_server_memory_streams() as (client_streams, server_streams):
+        client_read, client_write = client_streams
+        server_read, server_write = server_streams
+
+        @asynccontextmanager
+        async def fake_stdio():
+            yield server_read, server_write
+
+        monkeypatch.setattr(srv, "stdio_server", fake_stdio)
+        async with anyio.create_task_group() as tg:
+            tg.start_soon(srv.serve)
+            async with ClientSession(client_read, client_write) as session:
+                await session.initialize()
+                result = await session.get_prompt("fetch", {"url": url})
+            tg.cancel_scope.cancel()
+        return result
+
+
+class TestFetchPromptAlignsWithTool:
+    """Slice 1 deliverable 6: the `fetch` prompt must render through `describe_fetch_result`
+    (so it keeps status/kind diagnostics, header, and truncation, not just a bare body/error)
+    and must run `media="deny"` like the tool (redirecting images/archives instead of guessing)."""
+
+    async def test_success_gets_the_same_header_as_the_tool(self, monkeypatch):
+        body = "# Doc\n\n" + ("word " * 300)
+
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            assert media == "deny", "the prompt must fetch with media='deny', same as the tool"
+            return _result(body, bytes=len(body))
+
+        result = await _run_fetch_prompt(monkeypatch, "https://ok.example/", fake)
+        text = result.messages[0].content.text
+        assert text.startswith("# https://ok.example/")
+        assert "cache_status: miss" in text  # the describe_fetch_result header, not a bare body
+        assert body in text
+
+    async def test_media_deny_redirects_images_like_the_tool(self, monkeypatch):
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            assert media == "deny"
+            return {"error": f"{url} is an image — use the `fetchImage` tool, not `fetch`.", "body": ""}
+
+        result = await _run_fetch_prompt(monkeypatch, "https://x.example/fig.png", fake)
+        text = result.messages[0].content.text
+        assert "ERROR" in text
+        assert "fetchImage" in text
+
+    async def test_failure_keeps_status_kind_diagnostics(self, monkeypatch):
+        """Before this fix the prompt path built its own <error> tag and lost the status/kind
+        classification describe_fetch_result derives (e.g. the HTTP code + meaning)."""
+        async def fake(url, user_agent, proxy_url=None, media="allow"):
+            return _result("tiny", http_status=404)
+
+        result = await _run_fetch_prompt(monkeypatch, "https://x.example/missing", fake)
+        text = result.messages[0].content.text
+        assert "HTTP 404" in text and "page not found" in text

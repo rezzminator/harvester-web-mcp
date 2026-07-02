@@ -8,7 +8,9 @@ import os
 import re
 import tempfile
 import time
+from enum import Enum
 from pathlib import Path
+from typing import NamedTuple
 from urllib.parse import unquote, urlparse
 
 from . import cache, convert, detect, html, mirror, net, oa, safe_archive, search
@@ -26,8 +28,28 @@ _PMID_RE = re.compile(r"^\d{7,9}$")
 # ── negative-result cache + in-flight dedup (see get_or_fetch) ──────────────────
 # A failing source must not be re-hammered: one DOI was fetched 18× in a real run.
 DEFAULT_NEG_TTL = 120.0
-_NEG_CACHE: dict[str, tuple[float, dict]] = {}
+_NEG_CACHE: dict[str, tuple[float, dict, float]] = {}
 _INFLIGHT: dict[str, "asyncio.Future[dict]"] = {}
+
+
+def _env_float(name: str, default: float) -> float:
+    """Read a float env var ONCE at import time — module-level constants below are the value;
+    tests monkeypatch the constant itself (see CLAUDE.md § Config), not the environment."""
+    raw = os.environ.get(name)
+    if raw is None:
+        return default
+    try:
+        return float(raw)
+    except ValueError:
+        log.warning("invalid %s=%r; using default %s", name, raw, default)
+        return default
+
+
+# R7: a timeout/connect/429 failure is likely to clear up soon — don't hold a live source dead
+# for the full negative-cache window. Read once at import time (unlike HARVESTER_NEG_TTL, which
+# stays dynamic via `_neg_ttl()` for backward compatibility with existing tests/behavior).
+HARVESTER_NEG_TTL_TRANSIENT = _env_float("HARVESTER_NEG_TTL_TRANSIENT", 15.0)
+_TRANSIENT_ERROR_KINDS = {"timeout", "connect"}
 
 
 def _neg_ttl() -> float:
@@ -42,27 +64,180 @@ def _neg_ttl() -> float:
         return DEFAULT_NEG_TTL
 
 
+def _is_transient_error(result: dict) -> bool:
+    """True for a failure likely to resolve on its own soon (R7): a slow/blocked connection or a
+    rate limit. Relies on `http_status`/`error_kind` being carried on the error dict (`_net_error`
+    sets both); an error with neither (a content-classification failure, e.g. a challenge or a
+    'no open-access copy' exhaustion) is never transient — it won't look different in 15s."""
+    if result.get("http_status") == 429:
+        return True
+    return result.get("error_kind") in _TRANSIENT_ERROR_KINDS
+
+
+def _neg_cache_key(item: str, media: str) -> str:
+    """The negative-cache/in-flight key for *item*, canonicalizing DOI forms (R7) so a bare DOI,
+    a ``doi:`` prefix, and a ``doi.org`` URL share ONE entry instead of each independently
+    re-running (and re-failing) the same OA chain."""
+    doi = _extract_doi_from_input(item)
+    ident = f"doi:{doi}" if doi else item
+    return f"{media}\x00{ident}"
+
+
 def _neg_cache_get(key: str) -> dict | None:
     """Return a COPY of a fresh cached error dict for *key* (annotated), evicting it if stale."""
     entry = _NEG_CACHE.get(key)
     if entry is None:
         return None
-    ts, result = entry
-    if time.monotonic() - ts >= _neg_ttl():
+    ts, result, ttl = entry
+    age = time.monotonic() - ts
+    if age >= ttl:
         _NEG_CACHE.pop(key, None)
         return None
     cached = dict(result)
     if cached.get("error"):
-        cached["error"] = f"{cached['error']} (recently failed; cached)"
+        retry_after = max(0, round(ttl - age))
+        cached["error"] = f"{cached['error']} (recently failed; cached — retry after {retry_after}s)"
     return cached
 
 
 def _neg_cache_evict_stale() -> None:
     """Drop expired negative-cache entries so the dict can't grow without bound."""
-    ttl = _neg_ttl()
     now = time.monotonic()
-    for k in [k for k, (ts, _r) in _NEG_CACHE.items() if now - ts >= ttl]:
+    for k in [k for k, (ts, _r, ttl) in _NEG_CACHE.items() if now - ts >= ttl]:
         _NEG_CACHE.pop(k, None)
+
+
+# ── rescue-graph: outcome classifier + Attempt trace (Slice 2) ──────────────────
+# Replaces the scattered ad-hoc "thin or challenge" / "no bytes" checks that used to be
+# re-derived slightly differently in each branch — one function, one vocabulary, so
+# `_html_result`, `_doc_result`, and the OA-candidate paths all agree on what a rung's result
+# WAS. See harvester-redesign.md §1.
+
+class Outcome(str, Enum):
+    OK = "ok"
+    THIN = "thin"
+    CHALLENGE = "challenge"
+    HTTP_4XX_WITH_BODY = "http_4xx_with_body"
+    WRONG_KIND = "wrong_kind"
+    EMPTY_CONVERT = "empty_convert"
+    DEAD_NET = "dead_net"
+    NOT_FOUND_PAGE = "not_found_page"
+
+
+class Attempt(NamedTuple):
+    """One rescue-graph rung actually tried: which rung, what target URL/id, what it yielded."""
+    rung: str
+    target: str
+    outcome: Outcome
+
+
+def classify_outcome(
+    *,
+    body_len: int = 0,
+    content_chars: int | None = None,
+    status: int | None = None,
+    error_kind: str | None = None,
+    challenge: bool = False,
+    not_found: bool = False,
+    wrong_kind: bool = False,
+    empty_convert: bool = False,
+    thin_min: int = THIN_MIN_CHARS,
+) -> Outcome:
+    """Classify one fetch/convert attempt into a single Outcome.
+
+    Precedence (most specific/actionable first): an explicit `empty_convert`/`wrong_kind` flag
+    from the caller (already definitively known, e.g. a magic-byte mismatch) wins outright; else
+    `dead_net` when there are literally no bytes to work with (a real connection failure, or a
+    response with an empty body regardless of status — R1 keeps ≥400 bodies, so an EMPTY 4xx
+    still lands here, matching pre-R1 behavior); else a detected bot/challenge page; a known
+    not-found page; a ≥400 status that DID carry a body (R1's `http_4xx_with_body`); a body too
+    short to be useful (`thin`); otherwise `ok`.
+    """
+    if empty_convert:
+        return Outcome.EMPTY_CONVERT
+    if wrong_kind:
+        return Outcome.WRONG_KIND
+    if body_len <= 0 and (status is None or status >= 400):
+        return Outcome.DEAD_NET
+    if challenge:
+        return Outcome.CHALLENGE
+    if not_found:
+        return Outcome.NOT_FOUND_PAGE
+    if status is not None and status >= 400:
+        return Outcome.HTTP_4XX_WITH_BODY
+    chars = content_chars if content_chars is not None else body_len
+    if chars < thin_min:
+        return Outcome.THIN
+    return Outcome.OK
+
+
+def _rungs_summary(trace: "list[Attempt]") -> str:
+    """Raw, comma-joined rung names for cache frontmatter / the result header — informational
+    provenance, so left un-aggregated (unlike `_rungs_phrase`, used only in terminal errors)."""
+    return ", ".join(a.rung for a in trace)
+
+
+def _rungs_phrase(trace: "list[Attempt]") -> str:
+    """A compact 'direct, chrome-impersonation, jina, oa-mirror(2 sources), wayback' phrase for
+    terminal error text — consecutive `oa:*` candidate rungs collapse into one `oa-mirror(N
+    source(s))` segment so an exhausted 7-source OA ladder doesn't read as noise."""
+    parts: list[str] = []
+    i, n = 0, len(trace)
+    while i < n:
+        rung = trace[i].rung
+        if rung.startswith("oa:"):
+            j = i
+            count = 0
+            while j < n and trace[j].rung.startswith("oa:"):
+                count += 1
+                j += 1
+            parts.append(f"oa-mirror({count} source{'s' if count != 1 else ''})")
+            i = j
+        else:
+            parts.append(rung)
+            i += 1
+    return ", ".join(parts)
+
+
+def _with_rungs(message: str, trace: "list[Attempt]") -> str:
+    """Append the rescue-graph trace to a terminal error — only once more than one rung ran (a
+    single-rung failure already names its own cause; the trace only adds value once the model
+    might otherwise think 're-fetching' is worth a turn)."""
+    if len(trace) <= 1:
+        return message
+    return f"{message} Rungs tried: {_rungs_phrase(trace)} — re-fetching will not help."
+
+
+def _finalize_with_rungs(res: "dict | None", trace: "list[Attempt]") -> "dict | None":
+    """Patch the accumulated rescue-graph trace into an artifact written by a helper that had no
+    visibility into `trace` itself (`_handle_binary_doc` → `_doc_result`/`_image_result`, called
+    from `_candidate_to_result`). A no-op when there's nothing to add or the path isn't a cached
+    `.md` artifact with frontmatter (e.g. a bare image path)."""
+    if not res or res.get("error") or len(trace) <= 1:
+        return res
+    md_path = res.get("md_path")
+    if not isinstance(md_path, Path) or md_path.suffix != ".md":
+        return res
+    try:
+        text = md_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return res
+    lines = text.splitlines(keepends=True)
+    if not lines or lines[0].rstrip("\n") != "---":
+        return res
+    end_idx = None
+    for i in range(1, len(lines)):
+        if lines[i].rstrip("\n") == "---":
+            end_idx = i
+            break
+    if end_idx is None or any(ln.startswith("rungs:") for ln in lines[1:end_idx]):
+        return res
+    lines.insert(end_idx, f"rungs: {_rungs_summary(trace)}\n")
+    try:
+        md_path.write_text("".join(lines), encoding="utf-8")
+    except OSError as e:
+        log.warning("could not annotate rungs onto %s: %s", md_path, e)
+    return res
 
 
 # ── result builders ───────────────────────────────────────────────────────────
@@ -87,25 +262,31 @@ def _ok(md_path, method: str, body: str, content_chars: int | None = None,
     }
 
 
-def _net_error(key: str, status: int | None, error_kind: str | None) -> dict:
-    if error_kind == "invalid":
-        msg = f"Invalid URL: {key}"
-    elif error_kind in net.CONNECTION_ERROR_REASONS:
-        msg = f"Could not reach {key}: {net.CONNECTION_ERROR_REASONS[error_kind]}."
-    elif status is not None and status >= 400:
-        meaning = net.HTTP_STATUS_MEANINGS.get(status, "request failed")
-        note = " — likely a bot-block or rate limit" if status in (403, 429, 503) else ""
-        msg = f"{key} returned HTTP {status} ({meaning}){note}."
-    else:
-        msg = f"Could not download {key}."
+def _net_error(
+    key: str, status: int | None, error_kind: str | None, trace: "list[Attempt] | None" = None
+) -> dict:
+    """Build the {"error": ...} dict for a download that returned no usable bytes.
+
+    Shares its wording with `describe.describe_fetch_result` via `net.failure_message` so the
+    same failure kind reads identically whether it's caught here (download-time) or classified
+    later at render time. Carries `http_status`/`error_kind` on the dict itself so `get_or_fetch`
+    can pick a negative-cache TTL (R7) without re-deriving them from the message text; embeds the
+    rescue-graph trace (R2/R3 etc. rungs already walked) when more than one rung was tried.
+    """
+    msg = net.failure_message(key, status, error_kind)
+    if msg is None:
+        msg = f"Could not download {key} — try `search` for an alternative source."
+    if trace:
+        msg = _with_rungs(msg, trace)
     log.warning("net error %s status=%s kind=%s", key, status, error_kind)
-    return {"error": msg, "body": ""}
+    return {"error": msg, "body": "", "http_status": status, "error_kind": error_kind}
 
 
 def _format_listing(members, key: str) -> str:
     lines = [
         f"# Archive: {key}", "",
-        f"{len(members)} member(s). Fetch one with `{key}::<name>`.", "",
+        f"{len(members)} member(s). Fetch one with `archive(source={key!r}, "
+        'member="<name>")` — pick a name from the table below.', "",
         "| name | size (bytes) | type |", "| --- | --- | --- |",
     ]
     for m in members:
@@ -162,7 +343,10 @@ async def _handle_binary_doc(
     return await _doc_result(str(bin_path), key, kind, True, user_agent, proxy_url)
 
 
-async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
+async def _html_result(
+    src, key, local, user_agent, proxy_url, trace: "list[Attempt] | None" = None
+) -> dict:
+    trace = trace if trace is not None else []
     md_path = cache.cache_file(key, "html", ".md")
     if md_path.exists():
         meta, body = cache.split_frontmatter(md_path.read_text(encoding="utf-8", errors="ignore"))
@@ -199,6 +383,10 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
     body = html.extract_content_from_html(raw)
     method = "local-trafilatura"
     content_chars = len(body.strip())
+    if not local:
+        trace.append(Attempt("direct", src, classify_outcome(
+            body_len=len(raw), content_chars=content_chars, status=http_status,
+            error_kind=error_kind, challenge=challenge)))
     log.info("html %s httpx -> %s chars=%d challenge=%s", key, method, content_chars, challenge)
 
     # (c) thin or Cloudflare challenge → retry with curl_cffi Chrome impersonation
@@ -208,13 +396,19 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
         if cffi_text:
             cffi_body = html.extract_content_from_html(cffi_text)
             cffi_chars = len(cffi_body.strip())
+            cffi_challenge = net.looks_like_challenge(cffi_text)
+            trace.append(Attempt("chrome-impersonation", src, classify_outcome(
+                body_len=len(cffi_text), content_chars=cffi_chars, status=_cffi_status,
+                challenge=cffi_challenge)))
             if cffi_chars > content_chars:
                 raw = cffi_text
                 body = cffi_body
                 content_chars = cffi_chars
-                challenge = net.looks_like_challenge(cffi_text)
+                challenge = cffi_challenge
                 method = "curl_cffi-trafilatura"
                 log.info("html %s curl_cffi won chars=%d", key, content_chars)
+        else:
+            trace.append(Attempt("chrome-impersonation", src, Outcome.DEAD_NET))
 
     # (d) still thin → Jina Reader as final fallback (skips private hosts)
     if not local and content_chars < THIN_MIN_CHARS and not net.is_private_host(src):
@@ -226,13 +420,20 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
             content_chars = jina_chars
             method = "jina-reader"
             challenge = False  # Jina bypassed the wall
+            trace.append(Attempt("jina", src, classify_outcome(
+                body_len=len(jina_body), content_chars=jina_chars, status=200 if jina_body else None)))
             log.info("html %s jina won chars=%d", key, content_chars)
+        else:
+            trace.append(Attempt("jina", src, classify_outcome(
+                body_len=len(jina_body), content_chars=jina_chars, status=200 if jina_body else None)))
 
     # (e) mirror fallback: scholarly DOI embedded in URL, or Wayback snapshot
     # Only when the full ladder still yields thin content or a bot challenge.
     if not local and (content_chars < THIN_MIN_CHARS or challenge) and not net.is_private_host(src):
         log.info("html %s ladder exhausted -> mirror fallback", key)
-        _mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url)
+        # R4: hand the mirror the best HTML text already in scope (httpx or curl_cffi, whichever
+        # is current in `raw`) so it doesn't re-fetch a page that just proved to be walled.
+        _mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url, trace, page_html=raw)
         if _mirror_res:
             return _mirror_res
 
@@ -241,16 +442,28 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
     # bug). Never cache it; return a clean error (which P1 then negative-caches).
     if not local and challenge:
         log.info("html %s -> unresolved bot/Cloudflare challenge", key)
-        return {"error": (
+        msg = _with_rungs(
             f"{key} is behind a bot/Cloudflare challenge (e.g. 'Are you a robot?') and no "
-            "open-access copy was found — content not retrievable."), "body": ""}
+            "open-access copy was found — content not retrievable. Use `search` to find a "
+            "mirror or alternative copy.", trace)
+        return {"error": msg, "body": ""}
+
+    # R6: a thin body from a ≥400 status ("soft 404") is a failure, not a near-empty success — it
+    # must be classified as an error (neg-cached, no artifact written) symmetrically with every
+    # other failure, instead of silently writing/returning a near-empty "ok" artifact.
+    if not local and content_chars < THIN_MIN_CHARS and http_status is not None and http_status >= 400:
+        log.info("html %s -> thin HTTP %s page after full ladder", key, http_status)
+        return _net_error(key, http_status, error_kind, trace)
 
     # arXiv's "no article / invalid identifier" page extracts as a short success body — reject it
     # so a nonexistent id isn't returned (and cached) as a silent wrong document.
     if not local and _is_not_found_page(src, body):
         log.info("html %s -> not-found/error page", key)
-        return {"error": (f"{key} returned a 'not found / invalid identifier' page — the "
-                          "resource does not exist."), "body": ""}
+        msg = _with_rungs(
+            f"{key} returned a 'not found / invalid identifier' page — the "
+            "resource does not exist. Double-check the identifier, or use "
+            "`findWorks`/`search` to locate the correct one.", trace)
+        return {"error": msg, "body": ""}
 
     # (f) metadata prefix, tidy, cache write. Image refs are LEFT as URLs — `fetch` never
     # downloads image binaries and never OCRs; the model views one on demand via `fetchImage`.
@@ -259,13 +472,17 @@ async def _html_result(src, key, local, user_agent, proxy_url) -> dict:
         body = meta_block + body
     body = html.tidy_markdown(body)
 
-    cache._write_md(md_path, key, method, body)
+    extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+    cache._write_md(md_path, key, method, body, extra=extra)
     log.info("html %s done method=%s chars=%d", key, method, content_chars)
     return _ok(md_path, method, body, content_chars=content_chars,
                http_status=http_status, error_kind=error_kind, challenge=challenge)
 
 
-async def _doc_result(src, key, kind, local, user_agent, proxy_url) -> dict:
+async def _doc_result(
+    src, key, kind, local, user_agent, proxy_url, trace: "list[Attempt] | None" = None
+) -> dict:
+    trace = trace if trace is not None else []
     md_path = cache.cache_file(key, kind, ".md")
     if md_path.exists():
         meta, body = cache.split_frontmatter(md_path.read_text(encoding="utf-8", errors="ignore"))
@@ -275,34 +492,65 @@ async def _doc_result(src, key, kind, local, user_agent, proxy_url) -> dict:
 
     if local:
         path = src
+        rung = "local"
     else:
         ext = os.path.splitext(key.split("?", 1)[0])[1] or "." + kind
         bin_path = cache.cache_file(key, kind, ext)
+        rung = "direct"  # default; reassigned below to whichever rung actually supplied bytes
         if not bin_path.exists():
             data, status, error_kind = await net.download_bytes(src, user_agent, proxy_url)
+            # R1 ripple guard: only the primary-URL HTML ladder may treat a ≥400 body as
+            # potential content — here a ≥400 body is an HTML error/wall page, not the document,
+            # and the binary cache is PERMANENT, so writing it would poison every later call.
+            # Exception: a literal %PDF served with a 4xx status IS the requested document when
+            # the kind is pdf (the magic proves it; some hosts mis-status real files). The error
+            # page's TEXT is kept — only for the citation_pdf_url/citation_doi meta-scrape below.
+            error_page = ""
+            if (data and status is not None and status >= 400
+                    and not (kind == "pdf" and data.startswith(b"%PDF"))):
+                error_page = data.decode("utf-8", errors="ignore")
+                data = b""
             if not data:
+                outcome = (Outcome.HTTP_4XX_WITH_BODY if error_page
+                           else classify_outcome(body_len=0, status=status, error_kind=error_kind))
+                trace.append(Attempt("direct", src, outcome))
                 # Retry with curl_cffi Chrome impersonation (handles walled CDNs / 403s)
-                log.info("doc %s download empty -> curl_cffi", key)
+                log.info("doc %s download empty/http-error -> curl_cffi", key)
                 imp_data, imp_status = await net.download_impersonated(src, proxy_url)
                 if imp_data:
-                    data, status, error_kind = imp_data, imp_status, None
+                    data, status, error_kind, rung = imp_data, imp_status, None, "chrome-impersonation"
+                else:
+                    trace.append(Attempt("chrome-impersonation", src, Outcome.DEAD_NET))
             if not data:
                 # A walled publisher PDF URL (e.g. tandfonline/sciencedirect/cell) usually carries
-                # an extractable DOI — pivot to the open-access mirror before giving up.
-                if not local:
-                    mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url)
-                    if mirror_res:
-                        return mirror_res
-                return _net_error(key, status, error_kind)
+                # an extractable DOI — pivot to the open-access mirror before giving up. The 4xx
+                # error page (if any) feeds the meta-scrape without a re-fetch (R4).
+                mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url, trace,
+                                                       page_html=error_page or None)
+                if mirror_res:
+                    return mirror_res
+                return _net_error(key, status, error_kind, trace)
             # Verify the bytes match the declared kind — a .pdf URL that serves an HTML wall must
             # NOT be fed to pymupdf and returned as a "successful" PDF (silent wrong document).
             if kind == "pdf" and not data.startswith(b"%PDF"):
                 sniffed = detect.sniff_magic(data[:16])
                 if sniffed:  # genuinely a different binary type → convert it correctly
                     return await _handle_binary_doc(data, src, key, sniffed, user_agent, proxy_url)
-                return {"error": (
+                # R2: the bytes in hand are (probably) an HTML wall/notice page, not the PDF —
+                # they likely carry a citation_pdf_url/citation_doi <meta> tag. Try that chain
+                # (reusing these bytes, no re-fetch) before giving up.
+                trace.append(Attempt(rung, src, Outcome.WRONG_KIND))
+                page_text = data.decode("utf-8", errors="ignore")
+                mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url, trace, page_html=page_text)
+                if mirror_res:
+                    return mirror_res
+                msg = _with_rungs(
                     f"{key} has a .pdf address but did not return a PDF ({len(data)} bytes of non-PDF "
-                    "content — likely an HTML paywall/login wall or a bot-block)."), "body": ""}
+                    "content — likely an HTML paywall/login wall or a bot-block). Use `search` to "
+                    "find an open-access copy.", trace)
+                return {"error": msg, "body": ""}
+            if trace:  # only note the winning rung when an earlier one already failed
+                trace.append(Attempt(rung, src, Outcome.OK))
             bin_path.write_bytes(data)
         path = str(bin_path)
 
@@ -310,9 +558,11 @@ async def _doc_result(src, key, kind, local, user_agent, proxy_url) -> dict:
         try:
             with open(path, "rb") as fh:
                 if not fh.read(5).startswith(b"%PDF"):
-                    return {"error": f"{key} has a .pdf extension but is not a PDF file.", "body": ""}
+                    return {"error": (
+                        f"{key} has a .pdf extension but is not a PDF file — check its actual "
+                        "contents before fetching it again."), "body": ""}
         except OSError as e:
-            return {"error": f"cannot read {key}: {e}", "body": ""}
+            return {"error": f"cannot read {key}: {e} — check the path and permissions.", "body": ""}
 
     method = {
         "pdf": "pdf:pymupdf4llm", "docx": "office:docling", "xlsx": "office:docling",
@@ -322,11 +572,23 @@ async def _doc_result(src, key, kind, local, user_agent, proxy_url) -> dict:
     body = html.tidy_markdown(body)
     if not body.strip():
         log.warning("doc %s (%s) converted to empty markdown", key, kind)
+        # R3: pivot to the mirror chain before erroring — a scanned/corrupt copy at one URL
+        # doesn't mean no open-access copy exists anywhere.
+        if not local:
+            trace.append(Attempt(rung, src, Outcome.EMPTY_CONVERT))
+            mirror_res = await _try_mirror_for_url(src, key, user_agent, proxy_url, trace)
+            if mirror_res:
+                return mirror_res
         hint = " — if it's a scanned/image-only PDF, set HARVESTER_PDF_OCR=1 to OCR it" if kind == "pdf" else ""
-        return {"error": (
+        msg = (
             f"Downloaded the {kind.upper()} from {key} but it converted to EMPTY text. It is "
-            f"likely scanned/image-only, corrupt, or password-protected{hint}.")[:600], "body": ""}
-    cache._write_md(md_path, key, method, body)
+            f"likely scanned/image-only, corrupt, or password-protected{hint}. Use `search` to "
+            "find an alternative copy.")
+        if not local:
+            msg = _with_rungs(msg, trace)
+        return {"error": msg[:700], "body": ""}
+    extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+    cache._write_md(md_path, key, method, body, extra=extra)
     log.info("doc %s done method=%s", key, method)
     return _ok(md_path, method, body)
 
@@ -340,6 +602,10 @@ async def _image_result(src, key, local, user_agent, proxy_url) -> dict:
         img_path = cache.cache_file(key, ext.lstrip("."), ext)
         if not img_path.exists():
             data, status, error_kind = await net.download_bytes(src, user_agent, proxy_url)
+            # R1 ripple guard: a ≥400 body here is an HTML error page, not the image — treat it
+            # as no-data (never write it under an image extension for a vision read).
+            if data and status is not None and status >= 400:
+                data = b""
             if not data:
                 # Retry with curl_cffi Chrome impersonation (handles walled image CDNs)
                 imp_data, imp_status = await net.download_impersonated(src, proxy_url)
@@ -407,6 +673,10 @@ async def _archive_result(src, key, kind, member, local, user_agent, proxy_url) 
         arc_cache = cache.cache_file(key, kind, ext)
         if not arc_cache.exists():
             data, status, error_kind = await net.download_bytes(src, user_agent, proxy_url)
+            # R1 ripple guard: a ≥400 body here is an HTML error page, not the archive — writing
+            # it as a .zip/.tar would make safe_archive refuse the cached file forever after.
+            if data and status is not None and status >= 400:
+                data = b""
             if not data:
                 # Retry with curl_cffi Chrome impersonation (handles walled archive downloads)
                 imp_data, imp_status = await net.download_impersonated(src, proxy_url)
@@ -429,7 +699,9 @@ async def _archive_result(src, key, kind, member, local, user_agent, proxy_url) 
     try:
         members = await asyncio.to_thread(safe_archive.list_archive, arc_path)
     except safe_archive.ArchiveError as e:
-        return {"error": f"{e} — refusing to list this archive for safety.", "body": ""}
+        return {"error": (f"{e} — refusing to list this archive for safety. Try a different "
+                          "source for its contents, or fetch individual files directly if "
+                          "URLs are known."), "body": ""}
     log.info("archive %s -> %d member(s)", key, len(members))
     body = _format_listing(members, key)
     return _ok(arc_path, "archive:listing", body, content_chars=THIN_MIN_CHARS + 1,
@@ -460,12 +732,14 @@ def _extract_doi_from_input(item: str) -> str | None:
 
 
 async def _mirror_pdf_result(
-    pdf_bytes: bytes, key: str, pmcid: str, user_agent: str, proxy_url: str | None
+    pdf_bytes: bytes, key: str, pmcid: str, user_agent: str, proxy_url: str | None,
+    trace: "list[Attempt] | None" = None,
 ) -> dict | None:
     """Save *pdf_bytes* to the cache, convert to markdown, append figures note.
 
     Returns a result dict (method ``mirror:europepmc-pdf``) or None on failure.
     """
+    trace = trace if trace is not None else []
     bin_path = cache.cache_file(key, "pdf", ".pdf")
     try:
         bin_path.write_bytes(pdf_bytes)
@@ -483,48 +757,64 @@ async def _mirror_pdf_result(
         " (fetch it to list+extract individual figures).*\n"
     )
     md_path = cache.cache_file(key, "pdf", ".md")
-    cache._write_md(md_path, key, "mirror:europepmc-pdf", body)
+    extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+    cache._write_md(md_path, key, "mirror:europepmc-pdf", body, extra=extra)
     log.info("mirror %s -> europepmc-pdf (%s)", key, pmcid)
     return _ok(md_path, "mirror:europepmc-pdf", body)
 
 
 async def _pmcid_to_result(
-    pmcid: str, key: str, user_agent: str, proxy_url: str | None
+    pmcid: str, key: str, user_agent: str, proxy_url: str | None,
+    trace: "list[Attempt] | None" = None,
 ) -> dict | None:
     """PMCID → open-access content: Europe PMC full-text PDF, else the PMC article HTML.
 
     Returns a result dict, or None when neither yields usable content. The artifact is cached
     under *key*. Shared by the DOI mirror and the bare-PMID/PMCID routing.
     """
+    trace = trace if trace is not None else []
     async with net._client(proxy_url) as client:
         pdf_bytes = await mirror.europepmc_pdf(pmcid, client)
     if pdf_bytes:
-        result = await _mirror_pdf_result(pdf_bytes, key, pmcid, user_agent, proxy_url)
+        result = await _mirror_pdf_result(pdf_bytes, key, pmcid, user_agent, proxy_url, trace)
         if result:
+            trace.append(Attempt("oa:europepmc-pdf", pmcid, Outcome.OK))
             return result
+        trace.append(Attempt("oa:europepmc-pdf", pmcid, Outcome.EMPTY_CONVERT))
+    else:
+        trace.append(Attempt("oa:europepmc-pdf", pmcid, Outcome.DEAD_NET))
     # PDF unavailable — try the PMC article HTML
     pmc_url = mirror.pmc_article_url(pmcid)
     pmc_raw = await net.fetch_raw(pmc_url, user_agent, proxy_url)
     if pmc_raw:
         pmc_body = html.extract_content_from_html(pmc_raw)
-        if len(pmc_body.strip()) > THIN_MIN_CHARS:
+        pmc_chars = len(pmc_body.strip())
+        if pmc_chars > THIN_MIN_CHARS:
+            trace.append(Attempt("oa:pmc-html", pmc_url, Outcome.OK))
             pmc_body = html.tidy_markdown(pmc_body)
             md_path = cache.cache_file(key, "html", ".md")
-            cache._write_md(md_path, key, "mirror:pmc-html", pmc_body)
+            extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+            cache._write_md(md_path, key, "mirror:pmc-html", pmc_body, extra=extra)
             log.info("pmcid %s -> pmc-html (%s)", pmcid, key)
             return _ok(md_path, "mirror:pmc-html", pmc_body)
+        trace.append(Attempt("oa:pmc-html", pmc_url, classify_outcome(content_chars=pmc_chars, status=200)))
+    else:
+        trace.append(Attempt("oa:pmc-html", pmc_url, Outcome.DEAD_NET))
     return None
 
 
 # ── open-access resolver: candidate-URL → content ───────────────────────────────
 async def _candidate_to_result(
-    cand: "oa.Candidate", key: str, user_agent: str, proxy_url: str | None
+    cand: "oa.Candidate", key: str, user_agent: str, proxy_url: str | None,
+    trace: "list[Attempt] | None" = None,
 ) -> dict | None:
     """Fetch ONE oa.Candidate URL (httpx → curl_cffi), verify it's real content, convert it.
 
     Returns a result dict, or None when the candidate yields nothing usable (so the caller tries
     the next one). The artifact is cached under *key* (the identifier), not the candidate URL.
     """
+    trace = trace if trace is not None else []
+    rung = f"oa:{cand.source}"
     # SSRF/scheme chokepoint for EVERY candidate (OA resolvers + the scraped citation_pdf_url):
     # candidate URLs come from third-party JSON / attacker-influenced page <meta> tags and bypass
     # the dispatch-time guard. Cheap lexical first filter here; the net layer resolves DNS + every
@@ -532,14 +822,29 @@ async def _candidate_to_result(
     _scheme = urlparse(cand.url).scheme.lower()
     if _scheme not in ("http", "https") or net.is_private_host(cand.url):
         log.warning("oa candidate refused (scheme/host) %s (%s): %s", cand.source, cand.kind_hint, cand.url)
-        return None
+        return None  # a security refusal, not a rung "attempt" — no trace entry
 
-    data, _status, _ekind, ct = await net.fetch_bytes_with_meta(cand.url, user_agent, proxy_url)
-    if not data:  # walled? retry with a Chrome TLS/JA3 fingerprint
-        data, _ = await net.download_impersonated(cand.url, proxy_url)
+    data, status, error_kind, ct = await net.fetch_bytes_with_meta(cand.url, user_agent, proxy_url)
+    # R1 ripple guard: only the primary-URL HTML ladder may treat a ≥400 body as potential
+    # content. A candidate is a RESCUE URL — a ≥400 status here means "this rung failed, try the
+    # next candidate", never "publish this body under the identifier key". One exception: a
+    # literal %PDF served with a 4xx status IS the document (the magic proves it; some mirrors
+    # mis-status real files). Discarding the body restores the pre-R1 no-bytes flow, so the
+    # curl_cffi impersonation retry below still gets its shot at the real content.
+    discarded_4xx = False
+    if data and status is not None and status >= 400 and not data[:5].startswith(b"%PDF"):
+        discarded_4xx = True
+        data = b""
+    if not data:  # walled or an error page? retry with a Chrome TLS/JA3 fingerprint
+        data, imp_status = await net.download_impersonated(cand.url, proxy_url)
+        if data:
+            status, error_kind, discarded_4xx = imp_status, None, False
         ct = ""
     if not data:
-        log.info("oa candidate %s (%s) -> no bytes", cand.source, cand.url)
+        outcome = (Outcome.HTTP_4XX_WITH_BODY if discarded_4xx
+                   else classify_outcome(body_len=0, status=status, error_kind=error_kind))
+        trace.append(Attempt(rung, cand.url, outcome))
+        log.info("oa candidate %s (%s) -> no usable bytes (status=%s)", cand.source, cand.url, status)
         return None
 
     head = data[:16]
@@ -551,35 +856,60 @@ async def _candidate_to_result(
             res = await _handle_binary_doc(data, cand.url, key, kind, user_agent, proxy_url)
         except Exception as e:
             log.warning("oa candidate convert failed %s: %s", cand.url, e)
+            trace.append(Attempt(rung, cand.url, Outcome.EMPTY_CONVERT))
             return None
         if res and not res.get("error") and (res.get("content_chars") or 0) > 0:
+            trace.append(Attempt(rung, cand.url, Outcome.OK))
             log.info("oa candidate %s (%s) -> %s", cand.source, cand.url, kind)
-            return res
+            return _finalize_with_rungs(res, trace)
+        trace.append(Attempt(rung, cand.url, Outcome.EMPTY_CONVERT))
+        return None
+
+    if kind in detect.ARCHIVE_KINDS:
+        # R5: a candidate serving a zip/7z/rar/tar (e.g. an EPUB, which is zip-shaped) has no
+        # text converter in this ladder — decoding it as UTF-8 below would silently cache binary
+        # noise as a "successful" text artifact. Reject; the caller tries the next candidate.
+        log.info("oa candidate %s (%s) -> archive-kind %s, no text converter — rejected",
+                 cand.source, cand.url, kind)
+        trace.append(Attempt(rung, cand.url, Outcome.WRONG_KIND))
         return None
 
     # Otherwise treat as HTML / plain text (publisher landing page, Gutenberg text, OCR .txt).
+    # Defense-in-depth for the R1 invariant: a ≥400 TEXT body is never published as the
+    # identifier's content. (Normally already discarded at the download step above — the only
+    # 4xx bytes kept there are %PDF, which take the binary branch — but this branch must hold
+    # the invariant locally too, so a future byte source can't reintroduce the leak.)
+    if status is not None and status >= 400:
+        trace.append(Attempt(rung, cand.url, Outcome.HTTP_4XX_WITH_BODY))
+        log.info("oa candidate %s (%s) -> HTTP %s text body rejected", cand.source, cand.url, status)
+        return None
     text = data.decode("utf-8", "ignore")
     if not text.strip() or net.looks_like_challenge(text):
+        trace.append(Attempt(rung, cand.url, Outcome.CHALLENGE if text.strip() else Outcome.DEAD_NET))
         log.info("oa candidate %s (%s) -> challenge/empty", cand.source, cand.url)
         return None
     low = text.lower()
     is_html = "<html" in low or "<!doctype html" in low or "<body" in low
     body = text if (cand.kind_hint == "txt" or not is_html) else html.extract_content_from_html(text)
     if len(body.strip()) <= THIN_MIN_CHARS:
+        trace.append(Attempt(rung, cand.url, Outcome.THIN))
         return None
+    trace.append(Attempt(rung, cand.url, Outcome.OK))
     body = html.tidy_markdown(body)
     md_path = cache.cache_file(key, "html", ".md")
-    cache._write_md(md_path, key, f"oa:{cand.source}", body)
+    extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+    cache._write_md(md_path, key, f"oa:{cand.source}", body, extra=extra)
     log.info("oa candidate %s (%s) -> %d chars", cand.source, cand.url, len(body))
     return _ok(md_path, f"oa:{cand.source}", body)
 
 
 async def _resolve_and_fetch(
-    candidates: "list[oa.Candidate]", key: str, label: str, user_agent: str, proxy_url: str | None
+    candidates: "list[oa.Candidate]", key: str, label: str, user_agent: str, proxy_url: str | None,
+    trace: "list[Attempt] | None" = None,
 ) -> dict | None:
     """Try each candidate in priority order; return the first that yields real content, else None."""
     for cand in candidates:
-        res = await _candidate_to_result(cand, key, user_agent, proxy_url)
+        res = await _candidate_to_result(cand, key, user_agent, proxy_url, trace)
         if res:
             log.info("%s %s -> %s (%s)", label, key, cand.url, cand.source)
             return res
@@ -688,6 +1018,7 @@ async def _doi_mirror_result(
 
     Tries in order: Europe PMC PDF → PMC article HTML → Wayback snapshot of doi.org URL.
     """
+    trace: "list[Attempt]" = []
     log.info("doi mirror %s", doi)
     # Cache-first: a repeated DOI must not re-download + re-convert (~40s) or write a second,
     # divergent artifact. DOI artifacts are keyed by the bare DOI (dedup across input forms).
@@ -702,13 +1033,13 @@ async def _doi_mirror_result(
     async with net._client(proxy_url) as client:
         pmcid = await mirror.doi_to_pmcid(doi, client)
         if pmcid:
-            res = await _pmcid_to_result(pmcid, doi, user_agent, proxy_url)
+            res = await _pmcid_to_result(pmcid, doi, user_agent, proxy_url, trace)
             if res:
                 return res
 
         # Full OA chain: Unpaywall / OpenAlex / Semantic-Scholar / CORE / DOAJ / arXiv / OSF.
         oa_res = await _resolve_and_fetch(
-            await oa.resolve_doi(doi, client), doi, "doi-oa", user_agent, proxy_url)
+            await oa.resolve_doi(doi, client), doi, "doi-oa", user_agent, proxy_url, trace)
         if oa_res:
             return oa_res
 
@@ -717,36 +1048,53 @@ async def _doi_mirror_result(
         wb_url = await mirror.wayback_raw_url(doi_url, client)
         if wb_url:
             wb_raw = await net.fetch_raw(wb_url, user_agent, proxy_url)
-            if wb_raw:
-                wb_body = html.extract_content_from_html(wb_raw)
-                if len(wb_body.strip()) > THIN_MIN_CHARS:
-                    wb_body = html.tidy_markdown(wb_body)
-                    md_path = cache.cache_file(doi, "html", ".md")
-                    cache._write_md(md_path, doi, "mirror:wayback", wb_body)
-                    log.info("doi mirror %s -> wayback", doi)
-                    return _ok(md_path, "mirror:wayback", wb_body)
+            wb_body = html.extract_content_from_html(wb_raw) if wb_raw else ""
+            wb_chars = len(wb_body.strip())
+            if wb_chars > THIN_MIN_CHARS:
+                trace.append(Attempt("wayback", wb_url, Outcome.OK))
+                wb_body = html.tidy_markdown(wb_body)
+                md_path = cache.cache_file(doi, "html", ".md")
+                extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+                cache._write_md(md_path, doi, "mirror:wayback", wb_body, extra=extra)
+                log.info("doi mirror %s -> wayback", doi)
+                return _ok(md_path, "mirror:wayback", wb_body)
+            trace.append(Attempt("wayback", wb_url, classify_outcome(
+                content_chars=wb_chars, status=200 if wb_raw else None)))
+        else:
+            trace.append(Attempt("wayback", doi_url, Outcome.DEAD_NET))
 
     log.warning("doi mirror %s -> no open-access source", doi)
-    return {"error": (
+    msg = _with_rungs(
         f"Found DOI {doi}, but no free, legal full text exists in any open-access source (checked "
         "Unpaywall, OpenAlex, Semantic Scholar, Europe PMC, CORE, DOAJ, arXiv/OSF, and the Wayback "
-        "Machine). The paper is likely paywalled — open the publisher's page directly, or look for "
-        "an author preprint."), "body": ""}
+        "Machine). The paper is likely paywalled — use `search` to find an author preprint or the "
+        "publisher's page directly.", trace)
+    return {"error": msg, "body": ""}
 
 
 async def _try_mirror_for_url(
-    src: str, key: str, user_agent: str, proxy_url: str | None
+    src: str, key: str, user_agent: str, proxy_url: str | None,
+    trace: "list[Attempt] | None" = None, page_html: str | None = None,
 ) -> dict | None:
     """Wall fallback: extract DOI from a publisher URL and resolve via mirror, or try Wayback.
 
     Returns a result dict on success, or None when no better content is found.
     Only called for non-private, non-local URLs after the full httpx/curl_cffi/Jina ladder.
+
+    R4: *page_html*, when supplied, is text the CALLER already fetched (e.g. the httpx/curl_cffi
+    body from the html ladder, or the mismatched bytes from a `.pdf`-serves-HTML doc download) —
+    reused for the citation_pdf_url/citation_doi meta-scrape instead of re-fetching a page that
+    just proved to be walled. Only when nothing was passed in do we fetch ourselves, and then via
+    curl_cffi Chrome impersonation (not plain httpx, which would likely hit the same wall again).
     """
+    trace = trace if trace is not None else []
     doi = mirror.extract_doi(src)
     meta_pdf = None
     if not doi:
-        # Rabbit hole: scrape the (blocked) landing page for citation_pdf_url / citation_doi.
-        page = await net.fetch_raw(src, user_agent, proxy_url)
+        page = page_html
+        if not page:
+            page, _status = await net.fetch_impersonated(src, proxy_url)
+            trace.append(Attempt("meta-scrape", src, Outcome.OK if page else Outcome.DEAD_NET))
         if page:
             m_doi, meta_pdf, _title = oa.extract_meta_links(page)
             doi = doi or m_doi
@@ -756,20 +1104,20 @@ async def _try_mirror_for_url(
         if meta_pdf:
             res = await _candidate_to_result(
                 oa.Candidate(oa._score("citation_pdf_url"), meta_pdf, "citation_pdf_url", kind_hint="pdf"),
-                key, user_agent, proxy_url)
+                key, user_agent, proxy_url, trace)
             if res:
                 log.info("mirror url %s -> citation_pdf_url", key)
                 return res
         if doi:
             pmcid = await mirror.doi_to_pmcid(doi, client)
             if pmcid:
-                res = await _pmcid_to_result(pmcid, key, user_agent, proxy_url)
+                res = await _pmcid_to_result(pmcid, key, user_agent, proxy_url, trace)
                 if res:
                     return res
 
         if doi:
             oa_res = await _resolve_and_fetch(
-                await oa.resolve_doi(doi, client), key, "mirror-oa", user_agent, proxy_url)
+                await oa.resolve_doi(doi, client), key, "mirror-oa", user_agent, proxy_url, trace)
             if oa_res:
                 return oa_res
 
@@ -777,14 +1125,20 @@ async def _try_mirror_for_url(
         wb_url = await mirror.wayback_raw_url(src, client)
         if wb_url:
             wb_raw = await net.fetch_raw(wb_url, user_agent, proxy_url)
-            if wb_raw:
-                wb_body = html.extract_content_from_html(wb_raw)
-                if len(wb_body.strip()) > THIN_MIN_CHARS:
-                    wb_body = html.tidy_markdown(wb_body)
-                    md_path = cache.cache_file(key, "html", ".md")
-                    cache._write_md(md_path, key, "mirror:wayback", wb_body)
-                    log.info("mirror url %s -> wayback", key)
-                    return _ok(md_path, "mirror:wayback", wb_body)
+            wb_body = html.extract_content_from_html(wb_raw) if wb_raw else ""
+            wb_chars = len(wb_body.strip())
+            if wb_chars > THIN_MIN_CHARS:
+                trace.append(Attempt("wayback", wb_url, Outcome.OK))
+                wb_body = html.tidy_markdown(wb_body)
+                md_path = cache.cache_file(key, "html", ".md")
+                extra = {"rungs": _rungs_summary(trace)} if len(trace) > 1 else None
+                cache._write_md(md_path, key, "mirror:wayback", wb_body, extra=extra)
+                log.info("mirror url %s -> wayback", key)
+                return _ok(md_path, "mirror:wayback", wb_body)
+            trace.append(Attempt("wayback", wb_url, classify_outcome(
+                content_chars=wb_chars, status=200 if wb_raw else None)))
+        else:
+            trace.append(Attempt("wayback", src, Outcome.DEAD_NET))
 
     log.info("mirror url %s -> no better content", key)
     return None
@@ -806,7 +1160,10 @@ async def _dispatch_one(
     low = stripped.lower()
 
     if not stripped:
-        return {"error": 'empty input — pass a URL, a file path, a DOI, an ISBN, or title:"...".', "body": ""}
+        return {"error": (
+            "empty input — pass a URL, a file path, a DOI, an ISBN, or a PMID/PMCID. For a "
+            "TITLE, use the `findWorks` tool instead (it returns a fetch handle to pass here); "
+            "`fetch` always errors on a bare title."), "body": ""}
 
     # A title is ambiguous — route it to the `findWorks` tool rather than guess which work it means.
     if low.startswith("title:"):
@@ -818,7 +1175,9 @@ async def _dispatch_one(
         raw = stripped[len("isbn:"):].strip()
         norm = oa.normalize_isbn(raw)
         if not norm:
-            return {"error": f"{raw!r} is not a valid ISBN-10/13 (check the digits / check digit).", "body": ""}
+            return {"error": (
+                f"{raw!r} is not a valid ISBN-10/13 (check the digits / check digit), or use "
+                "the `findWorks` tool with the title instead."), "body": ""}
         log.info("routing -> book resolver (isbn): %s", norm)
         return await _resolve_input("isbn", norm, base, user_agent, proxy_url)
 
@@ -874,7 +1233,9 @@ async def _dispatch_one(
     # SSRF guard: never fetch a private / internal / link-local host (covers obfuscated IP forms).
     if not local and net.is_private_host(src):
         log.warning("refusing private/internal host: %s", src)
-        return {"error": f"refusing to fetch a private or internal host: {base}", "body": ""}
+        return {"error": (
+            f"refusing to fetch a private or internal host: {base} — harvester only fetches "
+            "public internet resources; use the resource's public URL instead."), "body": ""}
 
     # A PubMed *search/results* URL is not an article — it 404s on fetch. Route to find/search.
     if not local and _is_pubmed_search_url(src):
@@ -899,14 +1260,16 @@ async def _dispatch_one(
             return {"error": reason, "body": ""}
         if not _is_file(rp):
             log.warning("local file not found: %s", base)
-            return {"error": f"local file not found: {base}", "body": ""}
+            return {"error": (
+                f"local file not found: {base} — check the path for typos, or use `search`/"
+                "`findWorks` if you meant to fetch it from the web instead."), "body": ""}
         if kind == "html":  # ambiguous local file — sniff magic bytes
             try:
                 with rp.open("rb") as fh:
                     head = fh.read(16)
             except OSError as e:
                 log.warning("cannot read %s: %s", rp, e)
-                return {"error": f"cannot read {base}: {e}", "body": ""}
+                return {"error": f"cannot read {base}: {e} — check the path and permissions.", "body": ""}
             sniffed = detect.sniff_magic(head)
             if sniffed:
                 kind = sniffed
@@ -922,7 +1285,10 @@ async def _dispatch_one(
         if kind in detect.ARCHIVE_KINDS:
             return await _archive_result(src, base, kind, member, local, user_agent, proxy_url)
         if member:
-            return {"error": f"the '::' member syntax is only valid for archives, not {kind}", "body": ""}
+            return {"error": (
+                f"the '::' member syntax is only valid for archives, not {kind} — drop the "
+                "'::member' suffix and fetch the source directly, or use "
+                "`archive(source=..., member=...)` if it is actually an archive."), "body": ""}
         if kind == "image":
             return await _image_result(src, base, local, user_agent, proxy_url)
         if kind == "html":
@@ -930,7 +1296,9 @@ async def _dispatch_one(
         return await _doc_result(src, base, kind, local, user_agent, proxy_url)
     except Exception as e:  # converters/archive libs can raise — surface a clean per-item error
         log.exception("get_or_fetch %s failed: %s", base, e)
-        return {"error": f"{type(e).__name__}: {e}", "body": ""}
+        return {"error": (
+            f"{type(e).__name__}: {e} — try `search` for an alternative source, or retry."),
+            "body": ""}
 
 
 async def get_or_fetch(
@@ -940,13 +1308,16 @@ async def get_or_fetch(
     re-hammering a failing source:
 
     * **Negative cache** — a result with an ``"error"`` key is remembered for
-      HARVESTER_NEG_TTL seconds (default 120); a repeat call inside the window returns a
-      copy of that error instead of re-fetching. Successes are never cached.
+      HARVESTER_NEG_TTL seconds (default 120; transient kinds — timeout/connect/HTTP 429 — get
+      the shorter HARVESTER_NEG_TTL_TRANSIENT instead, R7); a repeat call inside the window
+      returns a copy of that error instead of re-fetching. Successes are never cached. DOI-type
+      inputs are canonicalized (bare DOI / ``doi:`` / ``doi.org`` URL share one entry) so the
+      three forms of the same identifier don't each independently re-run the failed chain.
     * **In-flight dedup** — concurrent calls for the same (media, item) share ONE fetch.
 
     Same signature/contract as the dispatch itself: never raises; failures are {"error": ...}.
     """
-    key = f"{media}\x00{item}"
+    key = _neg_cache_key(item, media)
 
     cached = _neg_cache_get(key)
     if cached is not None:
@@ -968,7 +1339,8 @@ async def get_or_fetch(
         raise
     else:
         if isinstance(result, dict) and result.get("error"):
-            _NEG_CACHE[key] = (time.monotonic(), result)
+            ttl = HARVESTER_NEG_TTL_TRANSIENT if _is_transient_error(result) else _neg_ttl()
+            _NEG_CACHE[key] = (time.monotonic(), result, ttl)
             _neg_cache_evict_stale()
         if not fut.done():
             fut.set_result(result)

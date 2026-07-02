@@ -7,9 +7,9 @@ import os
 
 from mcp.types import TextContent
 
-from .cache import THIN_MIN_CHARS
+from .cache import THIN_MIN_CHARS, read_frontmatter
 from .log import get_logger
-from .net import CONNECTION_ERROR_REASONS, HTTP_STATUS_MEANINGS
+from .net import failure_message
 from .tokens import estimate_tokens
 
 log = get_logger("describe")
@@ -27,6 +27,33 @@ def _max_inline_chars() -> int:
     except ValueError:
         log.warning("invalid HARVESTER_MAX_INLINE_CHARS=%r; using default %d", raw, DEFAULT_MAX_INLINE_CHARS)
         return DEFAULT_MAX_INLINE_CHARS
+
+
+def _tokens_and_fetched_at(result: dict, body: str) -> "tuple[int, str]":
+    """Read `tokens` (token_count) and `fetched_at` from the cache frontmatter when available.
+
+    Both are already computed and written by `cache._write_md` at fetch time; reading them back
+    means the header never re-derives a number that could drift from what's on disk. Falls back
+    to a fresh estimate / "unknown" for artifacts with no frontmatter (images, archive listings).
+    """
+    md_path = result.get("md_path")
+    meta = read_frontmatter(md_path) if md_path else {}
+    try:
+        tokens = int(meta["token_count"])
+    except (KeyError, ValueError, TypeError):
+        tokens = estimate_tokens(body)
+    fetched_at = meta.get("fetched_at") or "unknown"
+    return tokens, fetched_at
+
+
+def _rungs_suffix(result: dict) -> str:
+    """` / rungs: direct, chrome-impersonation, jina` when the artifact's frontmatter recorded a
+    Slice 2 rescue-graph trace of more than one rung — omitted for the common single-rung case
+    so the header stays quiet when there's nothing rescue-worthy to report."""
+    md_path = result.get("md_path")
+    meta = read_frontmatter(md_path) if md_path else {}
+    rungs = meta.get("rungs")
+    return f" / rungs: {rungs}" if rungs else ""
 
 
 def describe_fetch_result(item: str, result: "dict | BaseException") -> TextContent:
@@ -50,33 +77,29 @@ def describe_fetch_result(item: str, result: "dict | BaseException") -> TextCont
     negative = challenge or error_kind is not None or (status is not None and status >= 400)
 
     if stripped and not (thin and negative):
+        tokens, fetched_at = _tokens_and_fetched_at(result, body)
         header = (
             f"# {item}\n"
             f"cache_status: {result['cache_status']} / method: {result['method']} / "
-            f"bytes: {result['bytes']} / path: {result['md_path']}"
+            f"bytes: {result['bytes']} / tokens: {tokens} / fetched_at: {fetched_at} / "
+            f"path: {result['md_path']}{_rungs_suffix(result)}"
         )
         cap = _max_inline_chars()
         if cap > 0 and len(body) > cap:
             note = (
-                f"\n\n— [truncated: first {cap} of {len(body)} chars. "
-                f'Full text cached at {result["md_path"]}; use searchCache("<term>") to search it, '
-                f"or re-fetch a narrower target.]"
+                f"\n\n— [truncated: first {cap} of {len(body)} chars. COMPLETE text is at "
+                f"{result['md_path']} — read that file from char {cap} for the rest. "
+                "`searchCache` locates WHICH cached pages match a pattern; it does not return "
+                "text.]"
             )
             body = body[:cap] + note
         return TextContent(type="text", text=f"{header}\n\n{body}")
 
-    if error_kind == "invalid":
-        msg = f"Invalid URL: {item}"
-    elif error_kind in CONNECTION_ERROR_REASONS:
-        msg = f"Could not reach {item}: {CONNECTION_ERROR_REASONS[error_kind]}."
-    elif challenge:
-        msg = f"Blocked by a Cloudflare/bot challenge at {item} — content not retrievable from this datacenter server."
-    elif status is not None and status >= 400:
-        meaning = HTTP_STATUS_MEANINGS.get(status, "request failed")
-        note = " — likely a bot-block or rate limit" if status in (403, 429, 503) else ""
-        msg = f"{item} returned HTTP {status} ({meaning}){note}."
-    else:
-        msg = f"Fetched {item} but no readable content could be extracted (JS-rendered or bot-blocked — not retrievable from this datacenter IP)."
+    msg = failure_message(item, status, error_kind, challenge)
+    if msg is None:
+        msg = (f"Fetched {item} but no readable content could be extracted (JS-rendered or "
+               "bot-blocked — not retrievable from this datacenter IP). Use `search` to find "
+               "an alternative copy, or `findWorks` if it is a scholarly title.")
     log.info("describe %s -> failure: %s", item, msg)
     return TextContent(type="text", text=f"# {item}\nERROR: {msg}")
 
@@ -98,7 +121,8 @@ def describe_size_result(item: str, result: "dict | BaseException") -> TextConte
         log.info("size_only %s -> empty body, reporting as error", item)
         return describe_fetch_result(item, {"error": (
             f"Fetched {item} but it yielded no readable content (empty after extraction) — "
-            "nothing to size."), "body": ""})
+            "nothing to size. Use `search` to find an alternative copy, or `findWorks` if it "
+            "is a scholarly title."), "body": ""})
     tokens = estimate_tokens(body)  # over-counting heuristic; safe to budget against
     payload = {
         "source": item,

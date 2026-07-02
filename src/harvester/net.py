@@ -44,6 +44,32 @@ CONNECTION_ERROR_REASONS = {
 }
 
 
+def failure_message(item: str, status: int | None, error_kind: str | None,
+                     challenge: bool = False) -> str | None:
+    """One shared sentence for a net-level fetch failure, naming the next move.
+
+    Shared by `dispatch._net_error` (a download that returned no bytes at all) and
+    `describe.describe_fetch_result` (rendering a finished dispatch result) so the wording for
+    the same failure kind never drifts between the two call sites. Returns None when *status*/
+    *error_kind*/*challenge* don't describe a classifiable net failure — the caller supplies its
+    own context-specific fallback (e.g. "no bytes downloaded" vs. "fetched but empty").
+    """
+    if error_kind == "invalid":
+        return f"Invalid URL: {item} — check it for typos, or use `search` to find the source."
+    if error_kind in CONNECTION_ERROR_REASONS:
+        return (f"Could not reach {item}: {CONNECTION_ERROR_REASONS[error_kind]}. Retry later, "
+                "or use `search` to find an alternative copy.")
+    if challenge:
+        return (f"{item} is behind a bot/Cloudflare challenge — content not retrievable from "
+                "this datacenter server. Use `search` to find a mirror or alternative copy.")
+    if status is not None and status >= 400:
+        meaning = HTTP_STATUS_MEANINGS.get(status, "request failed")
+        note = " — likely a bot-block or rate limit" if status in (403, 429, 503) else ""
+        return (f"{item} returned HTTP {status} ({meaning}){note}. Use `search` to find an "
+                "alternative copy, or `findWorks` if it is a scholarly title.")
+    return None
+
+
 def get_robots_txt_url(url: str) -> str:
     parsed = urlparse(url)
     return urlunparse((parsed.scheme, parsed.netloc, "/robots.txt", "", "", ""))
@@ -125,9 +151,13 @@ async def _stream_capped(client, url, user_agent) -> Tuple[bytes, int | None, st
         async with client.stream(
             "GET", url, follow_redirects=True, headers={"User-Agent": user_agent}, timeout=timeout
         ) as response:
-            if response.status_code >= 400:
-                log.warning("stream %s -> HTTP %d", url, response.status_code)
-                return b"", response.status_code, None, ""
+            # R1: a ≥400 response body is KEPT, not discarded — a soft-404/403-with-content still
+            # needs to reach extraction + meta-scrape (the dispatch layer decides what to do with
+            # it). INVARIANT for callers: only the primary-URL HTML ladder (_html_result) may
+            # treat a ≥400 body as potential content; every rescue/binary path (OA candidates,
+            # doc/image/archive downloads) treats ≥400 as that rung's FAILURE — see the
+            # "R1 ripple guard" comments in dispatch.py. A genuinely empty error body still ends
+            # up as empty `data`, so callers keyed on "no bytes" see the same thing as before.
             ct = response.headers.get("content-type", "")
             chunks: list[bytes] = []
             total = 0
@@ -138,6 +168,8 @@ async def _stream_capped(client, url, user_agent) -> Tuple[bytes, int | None, st
                     log.info("stream %s hit %d-byte cap — truncating", url, MAX_DOWNLOAD_BYTES)
                     break
             data = b"".join(chunks)[:MAX_DOWNLOAD_BYTES]
+            if response.status_code >= 400:
+                log.info("stream %s -> HTTP %d (%d bytes kept)", url, response.status_code, len(data))
             log.debug("stream %s -> %d (%d bytes, ct=%s)", url, response.status_code, len(data), ct)
             return data, response.status_code, None, ct
     except FetchNotAllowed as e:
