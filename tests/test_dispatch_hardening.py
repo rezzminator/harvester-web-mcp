@@ -1187,3 +1187,76 @@ class TestR7TransientTtlAndDoiCanonicalization:
         await dispatch.get_or_fetch("doi:10.1234/example", "ua")
         await dispatch.get_or_fetch("https://doi.org/10.1234/example", "ua")
         assert calls == 1, "10.x/y, doi:10.x/y, and the doi.org URL must share one neg-cache entry"
+
+
+# ── Jina staleness: a cached snapshot is refused, never returned as a live fetch ─
+
+def _fake_jina_client(monkeypatch, text: str, seen_headers: dict):
+    """Point net._client at a client whose GET returns `text`, recording the request headers."""
+    class FakeResponse:
+        status_code = 200
+
+        def __init__(self):
+            self.text = text
+
+    class FakeClient:
+        async def get(self, url, **kw):
+            seen_headers.update(kw.get("headers") or {})
+            return FakeResponse()
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr(net, "_client", lambda proxy_url=None, **kw: FakeClient())
+
+
+class TestJinaStaleSnapshotRefused:
+    """Jina admits a cached snapshot in its envelope, and _strip_jina_envelope drops that line —
+    so an unrequested snapshot of a DIFFERENT page would be cached as a fresh fetch."""
+
+    _STALE = (
+        "Title: Test Document\n"
+        "URL Source: https://example.com/\n"
+        "Warning: This is a cached snapshot of the original page, consider retry with caching opt-out.\n"
+        "\n"
+        "Markdown Content:\n"
+        "## Test Article\n"
+    )
+    _FRESH = (
+        "Title: Example Domain\n"
+        "URL Source: https://example.com/\n"
+        "\n"
+        "Markdown Content:\n"
+        "This domain is for use in documentation examples.\n"
+    )
+
+    async def test_no_cache_header_is_sent(self, monkeypatch):
+        headers = {}
+        _fake_jina_client(monkeypatch, self._FRESH, headers)
+
+        await net.fetch_jina("https://example.com", "ua")
+        assert headers.get("x-no-cache") == "true"
+
+    async def test_cached_snapshot_returns_empty(self, monkeypatch):
+        _fake_jina_client(monkeypatch, self._STALE, {})
+
+        body = await net.fetch_jina("https://example.com", "ua")
+        assert body == "", "a stale snapshot must fail the rung, not return as content"
+
+    async def test_fresh_body_still_returned_stripped(self, monkeypatch):
+        _fake_jina_client(monkeypatch, self._FRESH, {})
+
+        body = await net.fetch_jina("https://example.com", "ua")
+        assert body.startswith("This domain is for use")
+        assert "URL Source" not in body
+
+    async def test_phrase_deep_in_article_is_not_staleness(self, monkeypatch):
+        article = self._FRESH + "x" * net._JINA_ENVELOPE_SCAN_CHARS + \
+            "\nThe archivist noted this is a cached snapshot of the record.\n"
+        _fake_jina_client(monkeypatch, article, {})
+
+        body = await net.fetch_jina("https://example.com", "ua")
+        assert body, "the marker outside the envelope window must not refuse a real article"

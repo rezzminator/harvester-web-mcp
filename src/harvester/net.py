@@ -213,6 +213,20 @@ async def fetch_bytes_with_meta(
         return await _stream_capped(client, url, user_agent)
 
 
+# r.jina.ai serves its own cached snapshot when it has one and admits it in the envelope. The
+# snapshot can describe a DIFFERENT page than the live URL (example.com came back as an unrelated
+# "Test Article"), and _strip_jina_envelope drops the admission along with the rest of the
+# scaffolding — so a stale body would read as a fresh fetch. Scan only the envelope: an article that
+# merely quotes the phrase further down is not a staleness signal.
+_JINA_STALE_MARKER = "this is a cached snapshot"
+_JINA_ENVELOPE_SCAN_CHARS = 1000
+
+
+def _is_jina_stale(text: str) -> bool:
+    """True when Jina's envelope admits the body is a cached snapshot, not a live fetch."""
+    return _JINA_STALE_MARKER in text[:_JINA_ENVELOPE_SCAN_CHARS].lower()
+
+
 def _strip_jina_envelope(text: str) -> str:
     """r.jina.ai prefixes 'Title:/URL Source:/Published Time:/Markdown Content:' scaffolding — keep
     only the body so it doesn't leak into cached documents."""
@@ -411,7 +425,8 @@ async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) ->
     """Fetch via Jina Reader (https://r.jina.ai/<url>).
 
     Skips private hosts so internal URLs are never leaked to the external service.
-    Returns the markdown body, or "" on any error or 4xx response. Never raises.
+    Returns the markdown body, or "" on any error, 4xx response, or stale cached snapshot.
+    Never raises.
     """
     if is_private_host(url):
         log.debug("jina skipped private host %s", url)
@@ -422,10 +437,16 @@ async def fetch_jina(url: str, user_agent: str, proxy_url: str | None = None) ->
         async with _client(proxy_url) as client:
             response = await client.get(
                 jina_url, follow_redirects=True,
-                headers={"User-Agent": user_agent}, timeout=30,
+                # x-no-cache asks for a live fetch instead of Jina's snapshot.
+                headers={"User-Agent": user_agent, "x-no-cache": "true"}, timeout=30,
             )
         if response.status_code >= 400:
             log.warning("jina %s -> HTTP %d", url, response.status_code)
+            return ""
+        if _is_jina_stale(response.text):
+            # A snapshot that survived x-no-cache is unusable, not near-miss content: fail the rung
+            # so the ladder falls through to the mirror/Wayback rung instead of caching stale text.
+            log.warning("jina %s -> cached snapshot despite x-no-cache; refusing stale body", url)
             return ""
         log.debug("jina %s -> %d (%d chars)", url, response.status_code, len(response.text))
         return _strip_jina_envelope(response.text)
