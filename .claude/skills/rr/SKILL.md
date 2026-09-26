@@ -1,7 +1,7 @@
 ---
 name: rr
 version: "2.3.0"
-repo: "https://github.com/mreza0100/rr"
+repo: "https://github.com/rezzminator/rr"
 description: Launches Research and Report (RR) — a deterministic background Workflow that runs an unbounded, best-first, brainer-steered web crawl, DERIVES an answer (computing it when the answer must be built), and writes a cited multi-section report with a verdict and plan. Use when the user wants a researched answer or a topic landscape ("research X", "look into X", "RR X", "rr fast X") and a single web search is not enough. Modes: goal (answer one question) and collect (inventory a topic); "rr fast X" answers inline now via one quick sub-agent instead of the background Workflow. Runs in the background, returns a completion notification, and persists to .professor/RR/{slug}/.
 ---
 
@@ -27,7 +27,7 @@ One Opus **brainer** drives the whole run; everything else is its instrument.
 
 **Preflight — the fetch MCP (Harvester) must be live.** RR fetches only through `mcp__harvester__fetch` (built-in WebFetch is hook-denied), so a missing or dead server makes every fetch error and yields a snippet-only run. Before launching, check for the `mcp__harvester__*` tools (via ToolSearch):
 
-- **Missing** — hold the launch and point the user to the Harvester MCP (`https://github.com/mreza0100/harvester-web-mcp`) to install, then `/mcp` to connect.
+- **Missing** — hold the launch and point the user to the Harvester MCP (`https://github.com/rezzminator/harvester-web-mcp`) to install, then `/mcp` to connect.
 - **Present** — smoke-test with one `mcp__harvester__fetch` on a stable URL (`https://example.com`); a clean fetch means go, an error means have the user reconnect (`/mcp`) or restart the server — hold until it passes.
 
 Call the **Workflow tool**. It runs in the background; a completion notification returns the result — do not block on it. Use the **absolute** path to `workflow.js` (the skill's base dir is printed when the skill loads) — the working directory may sit inside a child project, where a relative path resolves against the CWD and 404s the bundle.

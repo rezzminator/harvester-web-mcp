@@ -11,7 +11,7 @@ and escalates through a four-stage wall-bypass ladder before surfacing an error.
 > does not expose sensitive data. (Credential and key files are refused — see
 > [Local-path support](#local-path-support-and-deny-paths).)
 
-- **Repo:** <https://github.com/mreza0100/harvester-web-mcp>
+- **Repo:** <https://github.com/rezzminator/harvester-web-mcp>
 - **Package name:** `harvester-mcp` (not yet on PyPI — install from source or from GitHub)
 - **Command / module:** `harvester` (`python -m harvester`)
 
@@ -253,7 +253,7 @@ The package is **not yet published to PyPI**. Install from source or straight fr
 ### From source
 
 ```bash
-git clone https://github.com/mreza0100/harvester-web-mcp
+git clone https://github.com/rezzminator/harvester-web-mcp
 cd harvester-web-mcp
 uv sync            # install dependencies into the local venv
 uv run harvester   # run the server (stdio)
@@ -263,10 +263,10 @@ uv run harvester   # run the server (stdio)
 
 ```bash
 # run without cloning
-uvx --from git+https://github.com/mreza0100/harvester-web-mcp harvester
+uvx --from git+https://github.com/rezzminator/harvester-web-mcp harvester
 
 # or install into an environment
-pip install git+https://github.com/mreza0100/harvester-web-mcp
+pip install git+https://github.com/rezzminator/harvester-web-mcp
 python -m harvester
 ```
 
@@ -287,7 +287,7 @@ Add to your MCP client config (the `git+https` form needs no clone):
   "mcpServers": {
     "harvester": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/mreza0100/harvester-web-mcp", "harvester"]
+      "args": ["--from", "git+https://github.com/rezzminator/harvester-web-mcp", "harvester"]
     }
   }
 }
@@ -300,7 +300,7 @@ To relocate the cache and enable web search, pass environment variables:
   "mcpServers": {
     "harvester": {
       "command": "uvx",
-      "args": ["--from", "git+https://github.com/mreza0100/harvester-web-mcp", "harvester"],
+      "args": ["--from", "git+https://github.com/rezzminator/harvester-web-mcp", "harvester"],
       "env": {
         "WEBFETCH_DIR": "/path/to/cache",
         "SEARXNG_URL": "http://127.0.0.1:8888"
